@@ -7,10 +7,10 @@
 using namespace std;
 
 /* must read something like this
-user  nice  system  idle  iowait  irq  softirq  steal
-cpu   40604  776    31003  8540127 11383   0     16146 0 0 0
-cpu0  4975    0     4518   1064452 2577    0     8085 0 0 0
-cpu1  4832   71     3570   1068762  1113   0     3386 0 0 0
+       user  nice  system  idle   iowait  irq  softirq  steal
+cpu   40604  776    31003  8540127  11383   0     16146 0 0 0
+cpu0  4975    0     4518   1064452  2577    0     8085 0 0 0
+cpu1  4832   71     3570   1068762  1113    0     3386 0 0 0
 */
 cpuInfo readCpuInfo() {
     cpuInfo info;
