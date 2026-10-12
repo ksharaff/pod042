@@ -21,7 +21,7 @@ NetInfo readNetInfo() {
         string name;
         unsigned long long rx = 0, tx = 0, skip = 0;
 
-        iss >> name >> rx; // interface name then received bytes
+        iss >> name >> rx; // interface name, then received bytes
         for(int i = 0; i < 7; i++) {
             iss >> skip;
         }
