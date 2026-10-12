@@ -68,3 +68,5 @@ Testing/
 .cache/
 
 pod042.log
+
+loadout.json

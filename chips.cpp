@@ -48,16 +48,23 @@ const vector<Chip>& ChipManager::chips() const {
 
 ChipResult ChipManager::enable(const string& name) {
     Chip* chip = find(name);
-    if(chip==nullptr) {
+    if (chip == nullptr) {
         return ChipResult::NotFound;
     }
-    if(chip->enabled) {
+    if (chip->enabled) {
         return ChipResult::AlreadyInState;
     }
-    if(usedSlots() + chip->cost > totalSlots_) {
-        logEvent(LogLevel::Info, "Chip Installed: " + name);
-        return ChipResult::Ok;
+
+    // Would installing this chip go over the slot budget? If so, refuse.
+    if (usedSlots() + chip->cost > totalSlots_) {
+        logEvent(LogLevel::Warning, "Cannot install chip " + name + ": not enough slots");
+        return ChipResult::NotEnoughSlots;
     }
+
+    // Everything fits: install it.
+    chip->enabled = true;
+    logEvent(LogLevel::Info, "Chip Installed: " + name);
+    return ChipResult::Ok;
 }
 
 ChipResult ChipManager::disable(const string& name) {
