@@ -6,7 +6,7 @@ using namespace std;
 
 struct Chip {
     string name;
-    string desc;
+    string description;
     int cost;
     bool enabled = false;
 };
