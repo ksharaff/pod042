@@ -42,6 +42,10 @@ const Color kAmber = Color::RGB(255, 176, 0);
 // gauge turns into color at or above this number
 const double kWarnFraction = 0.8;
 
+const std::string kChipNetwork = "NETWORK SCAN";
+const std::string kChipDisk = "DISK MONITOR";
+const std::string kChipLog = "LOG STREAM";
+
 struct Telemetry {
     MemInfo mem;
     DiskInfo disk;
@@ -66,7 +70,7 @@ std::string kbps(double bytesPerSec) {
 // Removes spaces, tabs and newlines from both ends of a string.
 std::string trim(const std::string& s) {
     const char* whitespace = " \t\r\n";
-    std::size_t start = s.find_first_not_of(whitespace);
+    std::size_t start = s.find_first_not_of(whitespace); //npos = "not found"
     if (start == std::string::npos) {
         return "";
     }
@@ -116,43 +120,48 @@ Element meter(const std::string& label, double fraction, const std::string& valu
 }
 
 // Builds the SYSTEM STATUS screen from a snapshot
-Element statusPanel(const Telemetry& t){
+Element statusPanel(const Telemetry& t, bool diskOn, bool netOn){
     // constexpr = constant computed at compile time.
     constexpr double GB = 1024.0 * 1024.0 * 1024.0;
 
     double memUsedKb = static_cast<double>(t.mem.totalKb - t.mem.availableKb);
     double memFrac = t.mem.totalKb > 0 ? memUsedKb / static_cast<double>(t.mem.totalKb) : 0.0;
 
-    double diskUsed = static_cast<double>(t.disk.totalBytes - t.disk.availableBytes);
-    double diskFrac = t.disk.totalBytes > 0 ? diskUsed / static_cast<double>(t.disk.totalBytes) : 0.0;
+    Element diskRow;
+    if (diskOn) {
+        double diskUsed = static_cast<double>(t.disk.totalBytes - t.disk.availableBytes);
+        double diskFrac = t.disk.totalBytes > 0 ? diskUsed / static_cast<double>(t.disk.totalBytes) : 0.0;
+        std::string diskText = t.disk.totalBytes > 0
+            ? std::to_string(static_cast<long>(diskUsed / GB)) + " / " +
+              std::to_string(static_cast<long>(static_cast<double>(t.disk.totalBytes) / GB)) + " GB"
+            : "READING...";
+        diskRow = meter("DISK", diskFrac, diskText);
+    } else {
+        diskRow = text("DISK    [" + kChipDisk + " NOT INSTALLED]") | dim;
+    }
+
+    Elements netRows;
+    if (netOn) {
+        netRows.push_back(text("NETWORK"));
+        netRows.push_back(text("  DOWNLOAD:  " + kbps(t.net.rxBytesPerSec)));
+        netRows.push_back(text("  UPLOAD:    " + kbps(t.net.txBytesPerSec)));
+    } else {
+        netRows.push_back(text("NETWORK [" + kChipNetwork + " NOT INSTALLED]") | dim);
+    }
 
     return vbox({
-        // SYSTEM STATUS
         text("SYSTEM STATUS") | bold,
         separator(),
         meter("CPU", t.cpuPercent / 100.0, pct(t.cpuPercent)),
-        
+        separatorEmpty(),
+        meter("MEM", memFrac,
+              std::to_string(static_cast<long>(memUsedKb / 1024.0)) + " / " +
+              std::to_string(t.mem.totalKb / 1024) + " MB"),
         separatorEmpty(),
 
-        // MEM
-        meter("MEM", memFrac, 
-            std::to_string(static_cast<long>(memUsedKb / 1024.0)) + " / " + 
-            std::to_string(t.mem.totalKb / 1024) + " MB"),
-        
-        separatorEmpty(),
-
-        // DISK
-        meter("DISK", diskFrac,
-            std::to_string(static_cast<long>(diskUsed / GB)) + " / " +
-            std::to_string(static_cast<long>(static_cast<double>(t.disk.totalBytes) / GB)) + " GB"),
-        
+        diskRow,
         separator(),
-        
-        // NETWORK
-        text("NETWORK"),
-        text("  DOWN  " + kbps(t.net.rxBytesPerSec)),
-        text("  UP  " + kbps(t.net.txBytesPerSec)),
-        separator(),
+        vbox(std::move(netRows)),
     });
 }
 
@@ -221,6 +230,11 @@ int main(int argc, char** argv) {
     int chipSelected = 0; // index of highlighted chip
     std::string chipMessage; // feedback line eg not enough slots
 
+    // The UI thread WRITES them (inside updateLabels); the refresher thread only READS them.
+    std::atomic<bool> netEnabled{false};
+    std::atomic<bool> diskEnabled{false};
+    std::atomic<bool> logEnabled{false};
+
     // lambda: small unnamed function stored  in a variable
     // [&] = capture: the lambda can use the variables around 
     // it by reference, not by copy
@@ -230,9 +244,12 @@ int main(int argc, char** argv) {
     auto updateLabels = [&] {
         chipLabels.clear();
         for(const Chip& c : chips.chips()) {
-            chipLabels.push_back((c.enabled ? "[ON]" : "[OFF]") + c.name + 
+            chipLabels.push_back((c.enabled ? "[ON] " : "[OFF] ") + c.name + 
                                 " (cost " + std::to_string(c.cost) + ")"); 
         }
+        netEnabled  = chips.isEnabled(kChipNetwork);
+        diskEnabled = chips.isEnabled(kChipDisk);
+        logEnabled  = chips.isEnabled(kChipLog);
     };
 
     updateLabels(); // fill labels once before UI starts
@@ -260,7 +277,9 @@ int main(int argc, char** argv) {
     std::mutex telemtryMutex;
     Telemetry telemetry;
     telemetry.mem = readMemInfo();
-    telemetry.disk = readDiskInfo("/");
+    if(diskEnabled) {
+        telemetry.disk=readDiskInfo("/");
+    }
 
     // a small helper that returns COPY of shared telemetry
     // lock is held only while copying, then released at closing brace
@@ -286,6 +305,8 @@ int main(int argc, char** argv) {
         // without this a busy cpu would add a new log line every second
         bool cpuAlertActive = false;
 
+        bool netPrimed = false;
+
         while(running) {
             // sleep 1 second
             for(int i = 0; i < 10 && running; ++i) {
@@ -294,16 +315,27 @@ int main(int argc, char** argv) {
             if(!running) break;
 
             cpuInfo nowCpu = readCpuInfo();
-            NetInfo nowNet = readNetInfo();
             auto nowTime = std::chrono::steady_clock::now();
-
             double seconds = std::chrono::duration<double>(nowTime - prevTime).count();
 
             Telemetry t;
             t.mem  = readMemInfo();
-            t.disk = readDiskInfo("/");
             t.cpuPercent = cpuUsagePercent(prevCpu, nowCpu);
-            t.net = netRates(prevNet, nowNet, seconds);
+
+            if(diskEnabled) {
+                t.disk = readDiskInfo("/");
+            }
+
+            if(netEnabled) {
+                NetInfo nowNet = readNetInfo();
+                if(netPrimed) {
+                    t.net = netRates(prevNet, nowNet, seconds);
+                }
+                prevNet = nowNet;
+                netPrimed = true;
+            } else {
+                netPrimed = false;
+            }
 
             bool cpuHigh = t.cpuPercent > 80.0;
             if(cpuHigh && !cpuAlertActive) {
@@ -319,7 +351,6 @@ int main(int argc, char** argv) {
             }
 
             prevCpu = nowCpu;
-            prevNet = nowNet;
             prevTime  = nowTime;
 
             screen.PostEvent(Event::Custom);
@@ -333,8 +364,8 @@ int main(int argc, char** argv) {
         "POD 042: INITIALIZING ANDROID SYSTEMS...",
         "MEMORY BANKS ............ OK",
         "PROCESSOR CORES ......... OK",
-        "STORAGE ARRAY ........... OK",
-        "NETWORK INTERFACE ....... OK",
+        "STORAGE ARRAY ........... " + std::string(chips.isEnabled(kChipDisk) ? "OK" : "OFFLINE"),
+        "NETWORK INTERFACE ....... " + std::string(chips.isEnabled(kChipNetwork) ? "OK" : "OFFLINE"),
         "CHIP LOADOUT ............ " + std::to_string(chips.usedSlots()) + "/" +
             std::to_string(chips.totalSlots()) + " SLOTS IN USE",
         "ALL SYSTEMS NOMINAL. WELCOME, " + toUpper(userName) + ".",
@@ -396,7 +427,7 @@ int main(int argc, char** argv) {
     // Screen 1: status
     // This lambda runs every time the screen is redrawn
     Component statusView = Renderer([&] {
-        return statusPanel(snapshotTelemetry());
+        return statusPanel(snapshotTelemetry(), diskEnabled, netEnabled);
     });
 
     // Screen 2: chips
