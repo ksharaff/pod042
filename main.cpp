@@ -1,3 +1,9 @@
+// MOST COMMENTS ARE WRITTEN BY THE AUTHOR HIMSELF
+// THE GOAT
+// KHALED SHARAFEDDIN
+
+// some are written by my boi, the second goat, CLAUDE
+
 // ---- Standard library headers ----
 #include <atomic>    // std::atomic: a variable that is safe to share between threads
 #include <chrono>    // time utilities (durations, clocks)
@@ -25,6 +31,12 @@
 #include "net.h"
 
 using namespace ftxui;
+
+// warning color
+const Color kAmber = Color::RGB(255, 176, 0);
+
+// gauge turns into color at or above this number
+const double kWarnFraction = 0.8;
 
 struct Telemetry {
     MemInfo mem;
@@ -67,6 +79,12 @@ std::string kbps(double bytesPerSec) {
 // One row: label, horizontal gauge, and value on the right
 // CPU [######      ] 42.0%
 Element meter(const std::string& label, double fraction, const std::string& value) {
+    Element bar = gauge(static_cast<float>(fraction));
+
+    if(fraction >= kWarnFraction) {
+        bar = bar | color(kAmber);
+    }
+    
     return hbox({
         text(label) | size(WIDTH, EQUAL, 6), // width exactly 6 characters
         gauge(static_cast<float>(fraction)) | flex, // flex to fill leftover space
@@ -74,6 +92,7 @@ Element meter(const std::string& label, double fraction, const std::string& valu
     });
 }
 
+// Builds the SYSTEM STATUS screen from a snapshot
 Element statusPanel(const Telemetry& t){
     // constexpr = constant computed at compile time.
     constexpr double GB = 1024.0 * 1024.0 * 1024.0;
@@ -85,22 +104,28 @@ Element statusPanel(const Telemetry& t){
     double diskFrac = t.disk.totalBytes > 0 ? diskUsed / static_cast<double>(t.disk.totalBytes) : 0.0;
 
     return vbox({
+        // SYSTEM STATUS
         text("SYSTEM STATUS") | bold,
         separator(),
         meter("CPU", t.cpuPercent / 100.0, pct(t.cpuPercent)),
         
         separatorEmpty(),
 
+        // MEM
         meter("MEM", memFrac, 
             std::to_string(static_cast<long>(memUsedKb / 1024.0)) + " / " + 
             std::to_string(t.mem.totalKb / 1024) + " MB"),
         
         separatorEmpty(),
 
+        // DISK
         meter("DISK", diskFrac,
             std::to_string(static_cast<long>(diskUsed / GB)) + " / " +
             std::to_string(static_cast<long>(static_cast<double>(t.disk.totalBytes) / GB)) + " GB"),
+        
         separator(),
+        
+        // NETWORK
         text("NETWORK"),
         text("  DOWN  " + kbps(t.net.rxBytesPerSec)),
         text("  UP  " + kbps(t.net.txBytesPerSec)),
@@ -145,7 +170,7 @@ int main() {
 
     ChipManager chips(4);
 
-    // Try to restore the saved loadout; on the first run there's no file yet.
+    // try to restore the saved loadout; on the first run there's no file yet.
     if (!loadLoadout(chips, "loadout.json")) {
         chips.enable("NETWORK SCAN");   // default loadout: 2 of 4 slots
         chips.enable("LOG STREAM");
@@ -196,6 +221,14 @@ int main() {
     telemetry.mem = readMemInfo();
     telemetry.disk = readDiskInfo("/");
 
+    // a small helper that returns COPY of shared telemetry
+    // lock is held only while copying, then released at closing brace
+    // several places need snapshot, so this avoids repeating the locking code.
+    auto snapshotTelemetry = [&] {
+        std::lock_guard<std::mutex> lock(telemtryMutex);
+        return telemetry;
+    };
+
     auto screen = ScreenInteractive::Fullscreen();
 
     // bool safe to read in one thread and wrie in another without mutex
@@ -205,8 +238,12 @@ int main() {
     std::thread refresher([&] {
         cpuInfo prevCpu = readCpuInfo();
         NetInfo prevNet = readNetInfo();
-
         auto prevTime = std::chrono::steady_clock::now();
+
+        // remembers whether cpu alert is currently active
+        // so we log only when the state changes
+        // without this a busy cpu would add a new log line every second
+        bool cpuAlertActive = false;
 
         while(running) {
             // sleep 1 second
@@ -227,6 +264,14 @@ int main() {
             t.cpuPercent = cpuUsagePercent(prevCpu, nowCpu);
             t.net = netRates(prevNet, nowNet, seconds);
 
+            bool cpuHigh = t.cpuPercent > 80.0;
+            if(cpuHigh && !cpuAlertActive) {
+                logEvent(LogLevel::Warning, "CPU usage high: " + pct(t.cpuPercent));
+            } else if(!cpuHigh && cpuAlertActive) {
+                logEvent(LogLevel::Info, "CPU usage back to normal");
+            }
+            cpuAlertActive = cpuHigh;
+
             {
                 std::lock_guard<std::mutex> lock(telemtryMutex);
                 telemetry = t;
@@ -239,8 +284,64 @@ int main() {
             screen.PostEvent(Event::Custom);
         }
     });
+    // =====================================================
+    // 3. BOOT SEQUENCE
+    // =====================================================
 
-    // 3. UI
+    const std::vector<std::string> bootLines = {
+        "POD 042: INITIALIZING ANDROID SYSTEMS...",
+        "MEMORY BANKS ............ OK",
+        "PROCESSOR CORES ......... OK",
+        "STORAGE ARRAY ........... OK",
+        "NETWORK INTERFACE ....... OK",
+        "CHIP LOADOUT ............ " + std::to_string(chips.usedSlots()) + "/" +
+            std::to_string(chips.totalSlots()) + " SLOTS IN USE",
+        "ALL SYSTEMS NOMINAL. WELCOME, 2B.",
+    };
+
+    // both are atomic bevause the boot thread writes them while UI reads them
+    std::atomic<bool> booting{true}; // true until seq ends or user skips
+    std::atomic<std::size_t> bootShown{0}; // counts how many lines are visible so far.
+
+    // sleeps for ms but wakes early if user skips or quits
+    // it sleeps imn 50 ms slices so reaction is almost instant
+    auto nap = [&](int ms) {
+        for(int i=0; i < ms && booting && running; i+=50) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
+    };
+
+    // boot thread reveals one line at a time
+    std::thread bootThread([&] {
+        for(std::size_t i = 0; i < bootLines.size() && booting && running; ++i) {
+            nap(450);
+            bootShown = i+1; // reveal next line
+            screen.PostEvent(Event::Custom); // redraw
+        }
+        nap(700); // pause on final line
+        booting = false; // switch to main UI
+        screen.PostEvent(Event::Custom);
+    });
+
+    auto bootScreen = [&]() -> Element {
+        std::size_t shown = bootShown; // read atomic once then reuse
+
+        Elements rows;
+        rows.push_back(text("YoRHa // BOOT SEQUENCE") | bold);
+        rows.push_back(separator());
+        for(std::size_t i=0;i<shown && i<bootLines.size(); ++i) {
+            rows.push_back(text(bootLines[i]));
+        }
+        rows.push_back(separator());
+        rows.push_back(gauge(static_cast<float>(shown) / static_cast<float>(bootLines.size())));
+        rows.push_back(text("PRESS ANY KEY TO SKIP") | dim);
+
+        return vbox(std::move(rows)) | border | size(WIDTH, EQUAL, 56) | center;
+    };
+
+    // =====================================================
+    // 4. UI
+    // =====================================================
     // Element: something you draw
     // Component: something that draws and reacts to input
     // Renderer() turns a function that returns an element into a component
@@ -254,13 +355,7 @@ int main() {
     // Screen 1: status
     // This lambda runs every time the screen is redrawn
     Component statusView = Renderer([&] {
-        Telemetry snapshot;
-        {
-            // copy shared data while holding the lock, then release it
-            std::lock_guard<std::mutex> lock(telemtryMutex);
-            snapshot = telemetry;
-        }
-        return statusPanel(snapshot);
+        return statusPanel(snapshotTelemetry());
     });
 
     // Screen 2: chips
@@ -270,7 +365,6 @@ int main() {
     Component chipsView = Renderer(chipMenu, [&] {
         double used = chips.usedSlots();
         double total = chips.totalSlots();
-
         const Chip& selected = chips.chips()[static_cast<std::size_t>(chipSelected)];
         return vbox({
             text("CHIP CONFIGURATION") | bold,
@@ -281,7 +375,7 @@ int main() {
             chipMenu->Render(), // list of chips
             separator(),
             text(selected.description) | dim, // dim = fainter text style
-            text(chipMessage) | bold,
+            text(chipMessage) | bold | color(kAmber),
             text("RIGHT: focus list ENTER: install / remove") | dim,
         });
     });
@@ -292,6 +386,12 @@ int main() {
         rows.push_back(text("System LOGS") | bold);
         rows.push_back(separator());
         for(const std::string& line : readLogTail("pod042.log", 20)) {
+            Element row = text(line);
+            if(line.find("[WARN]") != std::string::npos) {
+                row = row | color(kAmber);
+            } else if(line.find("[ERROR]") != std::string::npos) {
+                row = row | color(Color::Red);
+            }
             rows.push_back(text(line));
         }
         return vbox(std::move(rows));
@@ -304,13 +404,23 @@ int main() {
     // Left/Right arrow keys move focus between them.
     Component layout = Container::Horizontal({tabMenu, tabs});
 
-    Component root = Renderer(layout, [&] {
+    Component root = Renderer(layout, [&]() -> Element {
+        if(booting) {
+            return bootScreen();
+        }
+
+        Telemetry snap = snapshotTelemetry();
+        Element statusLine = snap.cpuPercent > 80.0
+            ? text("POD 042: WARNING. CPU LOAD EXCEEDS THRESHOLD.") | bold | color(kAmber)
+            : text("SYSTEM STATUS: OPERATIONAL");
+        
+        
         return vbox({
             // Header box
             vbox({
                 text("YoRHa // UNIT DIAGNOSTICS") | bold,
                 text("ANDROID ID: 2B-042"),
-                text("SYSTEM STATUS: OPERATIONAL"),
+                statusLine,
             }) | border,
             // Middle: menu on the left, active screen on the right
             hbox({
@@ -323,6 +433,13 @@ int main() {
     });
 
     root = CatchEvent(root, [&](Event event){
+        if(booting) {
+            if(event==Event::Custom || event.is_mouse()){
+                return false;
+            }
+            booting = false;
+            return true;
+        }
         if(event==Event::Character('q') || event==Event::Character('Q')) {
             screen.ExitLoopClosure()();
             return true;
@@ -330,12 +447,14 @@ int main() {
         return false;
     });
 
-    // 4. RUN: blocks here, drawing and handling keys, until Q is pressed
+    // 5. RUN: blocks here, drawing and handling keys, until Q is pressed
     screen.Loop(root);
 
-    // 5. SHUTDOWN: stop background thread cleanly
+    // 6. SHUTDOWN: stop background thread cleanly
     running = false; // tell refresher loop to stop
+    booting = false;
     refresher.join(); // wait until it has actually finished
+    bootThread.join();
     logEvent(LogLevel::Info, "POD-042 Shutdown.");
     return 0;
 }
