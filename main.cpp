@@ -13,6 +13,9 @@
 #include <string>
 #include <thread>    // std::thread: runs a function in the background
 #include <vector>
+#include <iostream>
+#include <cctype>   // std::toupper: converts a letter to uppercase
+
 
 // FTXUI headers
 // component.hpp:          interactive pieces (menus, containers, key handling)
@@ -29,6 +32,7 @@
 #include "log.h"
 #include "meminfo.h"
 #include "net.h"
+#include "profile.h"
 
 using namespace ftxui;
 
@@ -57,6 +61,25 @@ std::string kbps(double bytesPerSec) {
     char buf[32];
     std::snprintf(buf, sizeof(buf), "%.1f KB/s", bytesPerSec / 1024.0);
     return buf;
+}
+
+// Removes spaces, tabs and newlines from both ends of a string.
+std::string trim(const std::string& s) {
+    const char* whitespace = " \t\r\n";
+    std::size_t start = s.find_first_not_of(whitespace);
+    if (start == std::string::npos) {
+        return "";
+    }
+    std::size_t end = s.find_last_not_of(whitespace);
+    return s.substr(start, end - start + 1);   // substr(startPosition, length)
+}
+
+
+std::string toUpper(std::string s) {
+    for (char& c : s) {
+        c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+    }
+    return s;
 }
 // ----------------------------------------------------------------------------
 // meter(): draws one row like   CPU   [#######     ]  42.0%
@@ -160,9 +183,27 @@ std::vector<std::string> readLogTail(const std::string& path, std::size_t count)
 // MAIN
 // =====================================================
 
-int main() {
-
+int main(int argc, char** argv) {
     logEvent(LogLevel::Info, "POD-042 Booting");
+
+    // "./build/pod042 --rename" forces the name prompt again.
+    bool askForName = false;
+    for (int i = 1; i < argc; ++i) {
+        if (std::string(argv[i]) == "--rename") {
+            askForName = true;
+        }
+    }
+
+    std::string userName;
+    if (askForName || !loadName(userName, "profile.json")) {
+        std::cout << "POD 042: ENTER OPERATOR DESIGNATION: ";
+        std::getline(std::cin, userName);
+        userName = trim(userName);
+        if (userName.empty()) {
+            userName = "UNIT";
+        }
+        saveName(userName, "profile.json");
+    }
 
     // =====================================================
     // 1. CHIPS: create manager and restore saved loadout.
@@ -296,7 +337,7 @@ int main() {
         "NETWORK INTERFACE ....... OK",
         "CHIP LOADOUT ............ " + std::to_string(chips.usedSlots()) + "/" +
             std::to_string(chips.totalSlots()) + " SLOTS IN USE",
-        "ALL SYSTEMS NOMINAL. WELCOME, 2B.",
+        "ALL SYSTEMS NOMINAL. WELCOME, " + toUpper(userName) + ".",
     };
 
     // both are atomic bevause the boot thread writes them while UI reads them
@@ -412,14 +453,14 @@ int main() {
         Telemetry snap = snapshotTelemetry();
         Element statusLine = snap.cpuPercent > 80.0
             ? text("POD 042: WARNING. CPU LOAD EXCEEDS THRESHOLD.") | bold | color(kAmber)
-            : text("SYSTEM STATUS: OPERATIONAL");
+            : text("SYSTEM STATUS: OPERATIONAL") | bold;
         
         
         return vbox({
             // Header box
             vbox({
                 text("YoRHa // UNIT DIAGNOSTICS") | bold,
-                text("ANDROID ID: 2B-042"),
+                text("NAME: " + userName) | bold,
                 statusLine,
             }) | border,
             // Middle: menu on the left, active screen on the right
