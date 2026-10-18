@@ -2,7 +2,7 @@
 // THE GOAT
 // KHALED SHARAFEDDIN
 
-// some are written by my boi, the second goat, CLAUDE
+// some are written by the second goat, CLAUDE
 
 // ---- Standard library headers ----
 #include <atomic>    // std::atomic: a variable that is safe to share between threads
@@ -15,6 +15,8 @@
 #include <vector>
 #include <iostream>
 #include <cctype>   // std::toupper: converts a letter to uppercase
+#include <map>
+#include <set>
 
 
 // FTXUI headers
@@ -34,6 +36,7 @@
 #include "net.h"
 #include "profile.h"
 #include "connections.h"
+#include "process.h"
 
 using namespace ftxui;
 
@@ -46,12 +49,17 @@ const double kWarnFraction = 0.8;
 const std::string kChipNetwork = "NETWORK SCAN";
 const std::string kChipDisk = "DISK MONITOR";
 const std::string kChipLog = "LOG STREAM";
+const std::string kChipProcess = "PROCESS WATCH";
+const std::size_t kMaxProcessRows = 12; // How many processes the screen shows (also limits what we copy around each second).
+
 
 struct Telemetry {
     MemInfo mem;
     DiskInfo disk;
     double cpuPercent = 0.0;
     NetRates net;
+    std::vector<ProcessInfo> processes; // top processes by CPU (empty unless the chip is installed)
+    std::size_t processCount = 0;
 };
 
 // formats 12.345 to 12.3%
@@ -97,10 +105,20 @@ std::string endpoint(const std::string& addr, unsigned int port) {
 // The terminal uses a monospaced font, so padded text lines up as a table.
 // .c_str() gives the C-style text that snprintf's %s expects.
 std::string formatRow(const std::string& state, const std::string& local,
-                      const std::string& remote) {
+                      const std::string& remote, const std::string& owner) {
+    char buf[160];
+    std::snprintf(buf, sizeof(buf), "%-12s %-22s %-22s %s",
+                  state.c_str(), local.c_str(), remote.c_str(), owner.c_str());
+    return buf;
+}
+
+// One row of the process table, with fixed-width columns.
+// "%-8s" = text, left-aligned, 8 wide. "%8s" = right-aligned, so numbers line up.
+std::string formatProcessRow(const std::string& pid, const std::string& name,
+                             const std::string& cpu, const std::string& mem) {
     char buf[128];
-    std::snprintf(buf, sizeof(buf), "%-12s %-24s %-24s",
-                  state.c_str(), local.c_str(), remote.c_str());
+    std::snprintf(buf, sizeof(buf), "%-8s %-18s %8s %10s",
+                  pid.c_str(), name.c_str(), cpu.c_str(), mem.c_str());
     return buf;
 }
 // ----------------------------------------------------------------------------
@@ -252,6 +270,7 @@ int main(int argc, char** argv) {
     std::atomic<bool> netEnabled{false};
     std::atomic<bool> diskEnabled{false};
     std::atomic<bool> logEnabled{false};
+    std::atomic<bool> processEnabled{false};
 
     // lambda: small unnamed function stored  in a variable
     // [&] = capture: the lambda can use the variables around 
@@ -268,6 +287,7 @@ int main(int argc, char** argv) {
         netEnabled  = chips.isEnabled(kChipNetwork);
         diskEnabled = chips.isEnabled(kChipDisk);
         logEnabled  = chips.isEnabled(kChipLog);
+        processEnabled = chips.isEnabled(kChipProcess);
     };
 
     updateLabels(); // fill labels once before UI starts
@@ -317,6 +337,8 @@ int main(int argc, char** argv) {
         cpuInfo prevCpu = readCpuInfo();
         NetInfo prevNet = readNetInfo();
         auto prevTime = std::chrono::steady_clock::now();
+        ProcessSampler processSampler;   // keeps its own previous sample
+        std::set<int> alertedPids;       // processes currently flagged as high CPU
 
         // remembers whether cpu alert is currently active
         // so we log only when the state changes
@@ -344,6 +366,7 @@ int main(int argc, char** argv) {
                 t.disk = readDiskInfo("/");
             }
 
+            // NETWORK WATCH
             if(netEnabled) {
                 NetInfo nowNet = readNetInfo();
                 if(netPrimed) {
@@ -353,6 +376,36 @@ int main(int argc, char** argv) {
                 netPrimed = true;
             } else {
                 netPrimed = false;
+            }
+
+            // PROCESS WATCH: sample all processes, but only while the chip is installed.
+            if (processEnabled) {
+                std::vector<ProcessInfo> procs = processSampler.sample(nowCpu);
+                t.processCount = procs.size();
+
+                // Log a warning when a process CROSSES the threshold (not every second):
+                // same edge-detection idea as the system CPU alert, but per process.
+                std::set<int> stillHigh;
+                for (const ProcessInfo& p : procs) {
+                    if (p.cpuPercent > 80.0) {
+                        stillHigh.insert(p.pid);
+                        if (alertedPids.count(p.pid) == 0) {   // count() is 0 if not in the set
+                            logEvent(LogLevel::Warning,
+                                     "Process high CPU: " + p.name + " (pid " +
+                                     std::to_string(p.pid) + ") " + pct(p.cpuPercent));
+                        }
+                    }
+                }
+                alertedPids = stillHigh;   // processes that dropped below are forgotten
+
+                // Keep only the top rows. The list is sorted, so these are the busiest.
+                if (procs.size() > kMaxProcessRows) {
+                    procs.resize(kMaxProcessRows);
+                }
+                t.processes = std::move(procs);
+            } else {
+                processSampler.reset();   // chip removed: forget the old sample
+                alertedPids.clear();
             }
 
             bool cpuHigh = t.cpuPercent > 80.0;
@@ -438,7 +491,9 @@ int main(int argc, char** argv) {
 
     // Left menu: list of screens. "tab" holds the selected index
     // menu stores the address of "tab" and updates it as you move
-    std::vector<std::string> tabNames = {"SYSTEM STATUS","NETWORK CONNECTIONS", "CHIP CONFIGURATION", "SYSTEM LOGS"};
+    std::vector<std::string> tabNames = {"SYSTEM STATUS", "NETWORK CONNECTIONS",
+                                         "PROCESS WATCH", "CHIP CONFIGURATION",
+                                         "SYSTEM LOGS"};
     int tab = 0;
     Component tabMenu = Menu(&tabNames, &tab, MenuOption::Vertical());
 
@@ -463,6 +518,12 @@ int main(int argc, char** argv) {
 
         std::vector<Connection> conns = readConnections();
 
+        // Which process owns each socket? Only looked up if PROCESS WATCH is installed.
+        std::map<unsigned long long, SocketOwner> owners;
+        if (processEnabled) {
+            owners = readSocketOwners();
+        }
+
         // Count a few states for the summary line.
         std::size_t established = 0;
         std::size_t listening = 0;
@@ -478,16 +539,26 @@ int main(int argc, char** argv) {
                             "   LISTENING: " + std::to_string(listening) +
                             "   TOTAL: " + std::to_string(conns.size())));
         rows.push_back(separator());
-        rows.push_back(text(formatRow("STATE", "LOCAL", "REMOTE")) | dim);
-
+        rows.push_back(text(formatRow("STATE", "LOCAL", "REMOTE", "OWNER")) | dim);
         const std::size_t maxRows = 15;   // keep the table inside the window
         std::size_t shown = 0;
         for (const Connection& c : conns) {
             if (shown >= maxRows) break;
 
+            // "-" = no owner info (chip off, or the socket has no owner such as TIME_WAIT).
+            // "?" = it has an owner we are not allowed to inspect.
+            std::string owner = "-";
+            if (processEnabled && c.inode != 0) {
+                auto found = owners.find(c.inode);
+                owner = (found != owners.end())
+                    ? found->second.name + " (" + std::to_string(found->second.pid) + ")"
+                    : "?";
+            }
+
             Element row = text(formatRow(c.state,
                                          endpoint(c.localAddr, c.localPort),
-                                         endpoint(c.remoteAddr, c.remotePort)));
+                                         endpoint(c.remoteAddr, c.remotePort),
+                                         owner));
 
             // A LISTEN socket bound to 0.0.0.0 accepts connections on EVERY network
             // interface, so it's reachable from outside this machine. That deserves
@@ -503,7 +574,48 @@ int main(int argc, char** argv) {
             rows.push_back(text("... +" + std::to_string(conns.size() - shown) + " more") | dim);
         }
         rows.push_back(separator());
-        rows.push_back(text("AMBER = LISTENING ON ALL INTERFACES (0.0.0.0)") | dim);
+                rows.push_back(text("AMBER = LISTENING ON ALL INTERFACES (0.0.0.0).  ? = OWNER NOT VISIBLE WITHOUT ROOT") | dim);
+        return vbox(std::move(rows));
+    });
+
+    // Screen: process watch. Only works if the PROCESS WATCH chip is installed.
+    Component processesView = Renderer([&]() -> Element {
+        if (!processEnabled) {
+            return vbox({
+                text("PROCESS WATCH") | bold,
+                separator(),
+                text(kChipProcess + " CHIP NOT INSTALLED") | color(kAmber),
+                text("Install it on the CHIP CONFIGURATION screen.") | dim,
+            });
+        }
+
+        Telemetry snap = snapshotTelemetry();
+
+        Elements rows;
+        rows.push_back(text("PROCESS WATCH") | bold);
+        rows.push_back(separator());
+        rows.push_back(text("PROCESSES: " + std::to_string(snap.processCount) +
+                            "   SHOWING TOP " + std::to_string(snap.processes.size()) +
+                            " BY CPU"));
+        rows.push_back(separator());
+        rows.push_back(text(formatProcessRow("PID", "NAME", "CPU", "MEMORY")) | dim);
+
+        if (snap.processes.empty()) {
+            rows.push_back(text("READING...") | dim);   // the first sample arrives within a second
+        }
+
+        for (const ProcessInfo& p : snap.processes) {
+            Element row = text(formatProcessRow(std::to_string(p.pid), p.name,
+                                                pct(p.cpuPercent),
+                                                std::to_string(p.rssKb / 1024) + " MB"));
+            if (p.cpuPercent > 80.0) {
+                row = row | color(kAmber);   // same threshold as the log warning
+            }
+            rows.push_back(row);
+        }
+
+        rows.push_back(separator());
+        rows.push_back(text("AMBER = CPU ABOVE 80% (ALSO LOGGED). 100% = ONE FULL CORE.") | dim);
         return vbox(std::move(rows));
     });
 
@@ -547,7 +659,8 @@ int main(int argc, char** argv) {
     });
     // Container::Tab holds several components but shows only the one at index
     // "tab" (the left menu's selection).
-    Component tabs = Container::Tab({statusView, connectionsView, chipsView, logsView}, &tab);
+    Component tabs = Container::Tab(
+        {statusView, connectionsView, processesView, chipsView, logsView}, &tab);
 
     // Container::Horizontal groups the left menu and the right panel, so
     // Left/Right arrow keys move focus between them.

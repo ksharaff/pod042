@@ -14,7 +14,7 @@ FetchContent_Declare(ftxui
 FetchContent_MakeAvailable(json ftxui)
 
 add_executable(pod042
-    main.cpp meminfo.cpp cpu.cpp disk.cpp net.cpp log.cpp chips.cpp loadout.cpp profile.cpp connections.cpp)
+    main.cpp meminfo.cpp cpu.cpp disk.cpp net.cpp log.cpp chips.cpp loadout.cpp profile.cpp connections.cpp process.cpp)
 
 # Common warnings, so mistakes show up at build time.
 target_compile_options(pod042 PRIVATE -Wall -Wextra)

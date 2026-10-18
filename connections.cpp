@@ -82,11 +82,15 @@ std::vector<Connection> readConnections() {
 
     while (std::getline(file, line)) {
         std::istringstream iss(line);
+        
         std::string slot, local, remote, stateHex;
-        // The first four columns: slot ("0:"), local, remote, state.
-        iss >> slot >> local >> remote >> stateHex;
+        std::string queues, timer, retransmits, uid, timeout;   // columns we skip
+        unsigned long long inode = 0;                            // the last column we want
+        iss >> slot >> local >> remote >> stateHex
+            >> queues >> timer >> retransmits >> uid >> timeout >> inode;
 
         Connection c;
+        c.inode = inode;
         if (!parseEndpoint(local, c.localAddr, c.localPort)) continue;    // skip bad lines
         if (!parseEndpoint(remote, c.remoteAddr, c.remotePort)) continue;
 

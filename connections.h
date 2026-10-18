@@ -10,6 +10,8 @@ struct Connection {
     unsigned int remotePort = 0;
 
     std::string state; // ESTABLISHED, LISTEN
+    
+    unsigned long long inode = 0;   // socket id; used to find the owning process
 };
 
 std::vector<Connection> readConnections();
