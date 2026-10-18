@@ -17,6 +17,8 @@
 #include <cctype>   // std::toupper: converts a letter to uppercase
 #include <map>
 #include <set>
+#include <algorithm>
+
 
 
 // FTXUI headers
@@ -39,6 +41,7 @@
 #include "process.h"
 #include "snapshot.h"
 #include "pod.h"
+#include "changes.h"
 
 using namespace ftxui;
 
@@ -51,6 +54,7 @@ const std::size_t kMaxProcessRows = 12; // How many processes the screen shows (
 const int kTabChips = 3; // loadout presets
 
 const int kHeartbeatSeconds = 60;
+const std::size_t kMaxChangesPerSample = 5;
 
 // Typewriter timing for the boot sequence. Raise them to type slower.
 const int kCharDelayMs = 30;
@@ -107,14 +111,6 @@ std::string toUpper(std::string s) {
         c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
     }
     return s;
-}
-
-// "127.0.0.1" + 8080 -> "127.0.0.1:8080"
-std::string endpoint(const std::string& addr, unsigned int port) {
-    if (addr.find(':') != std::string::npos) {
-        return "[" + addr + "]:" + std::to_string(port);
-    }
-    return addr + ":" + std::to_string(port);
 }
 
 // Formats one table row with fixed-width columns.
@@ -381,9 +377,6 @@ int main(int argc, char** argv) {
         ProcessSampler processSampler;   // keeps its own previous sample
         std::set<int> alertedPids;       // processes currently flagged as high CPU
 
-        // remembers whether cpu alert is currently active
-        // so we log only when the state changes
-        // without this a busy cpu would add a new log line every second
         bool cpuAlertActive = false;
 
         bool netPrimed = false;
@@ -391,6 +384,38 @@ int main(int argc, char** argv) {
         // For the Pod heartbeat
         const auto startTime = std::chrono::steady_clock::now();
         auto lastHeartbeat = startTime;
+
+        ChangeDetector detector;   // remembers the previous sample for the event feed
+        // Writes detected changes to the log. Every check below passes its result through here.
+        auto publish = [&](std::vector<Change> changes) {
+            if (changes.empty()) {
+                return;
+            }
+            limitChanges(changes, kMaxChangesPerSample);
+
+            // Finding a socket's owner scans every process's open files, which is
+            // expensive. Do it only when a change involves a socket AND the
+            // PROCESS WATCH chip is installed.
+            std::map<unsigned long long, SocketOwner> owners;
+            const bool needOwners = processEnabled &&
+                std::any_of(changes.begin(), changes.end(),
+                            [](const Change& c) { return c.inode != 0; });
+            if (needOwners) {
+                owners = readSocketOwners();
+            }
+
+            for (const Change& c : changes) {
+                std::string message = c.message;
+                if (c.inode != 0) {
+                    auto found = owners.find(c.inode);
+                    if (found != owners.end()) {
+                        message += " [" + found->second.name + " (pid " +
+                                   std::to_string(found->second.pid) + ")]";
+                    }
+                }
+                logEvent(c.level, message);
+            }
+        };
 
         while(running) {
             // sleep 1 second
@@ -412,21 +437,26 @@ int main(int argc, char** argv) {
             }
 
             // NETWORK WATCH
-            if(netEnabled) {
+            if (netEnabled) {
                 NetInfo nowNet = readNetInfo();
-                if(netPrimed) {
+                if (netPrimed) {
                     t.net = netRates(prevNet, nowNet, seconds);
                 }
                 prevNet = nowNet;
                 netPrimed = true;
+
+                // Event feed: new listeners and new connections since the last sample.
+                publish(detector.checkConnections(readConnections()));
             } else {
-                netPrimed = false;
+                netPrimed = false;               // forget the old reading
+                detector.resetConnections();     // and the old connection list
             }
 
             // PROCESS WATCH: sample all processes, but only while the chip is installed.
             if (processEnabled) {
                 std::vector<ProcessInfo> procs = processSampler.sample(nowCpu);
                 t.processCount = procs.size();
+                publish(detector.checkProcesses(procs));   // log programs seen for the first time
 
                 // Log a warning when a process CROSSES the threshold (not every second):
                 // same edge-detection idea as the system CPU alert, but per process.
@@ -451,6 +481,7 @@ int main(int argc, char** argv) {
             } else {
                 processSampler.reset();   // chip removed: forget the old sample
                 alertedPids.clear();
+                detector.resetProcesses();   // reinstalling starts a fresh baseline
             }
 
             bool cpuHigh = t.cpuPercent > 80.0;

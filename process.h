@@ -4,6 +4,11 @@
 #include <vector>
 #include "cpu.h"
 
+// Replaces control characters (newlines, escape codes, ...) in a process name with '?'.
+// Process names are chosen by the processes themselves, so they are untrusted input:
+// without this, a process could forge log lines or mess up the terminal.
+std::string sanitizeName(std::string name);
+
 struct ProcessInfo {
     int pid = 0;
     std::string name;

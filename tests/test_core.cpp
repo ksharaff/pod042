@@ -20,6 +20,8 @@
 #include "loadout.h"
 #include "net.h"
 #include "profile.h"
+#include "changes.h"
+#include "process.h"
 
 // Helpers private to this file.
 namespace {
@@ -291,4 +293,195 @@ TEST(Profile, EmptyNameCountsAsMissing) {
     EXPECT_EQ(name, "keep me");
 
     std::filesystem::remove(path);
+}
+
+// ---------------------------------------------------------------------------
+// Event feed (ChangeDetector)
+// ---------------------------------------------------------------------------
+
+namespace {
+
+// Builds a Connection with only the fields the detector looks at.
+Connection makeConn(const std::string& state,
+                    const std::string& localAddr, unsigned int localPort,
+                    const std::string& remoteAddr, unsigned int remotePort,
+                    unsigned long long inode = 0) {
+    Connection c;
+    c.state = state;
+    c.localAddr = localAddr;
+    c.localPort = localPort;
+    c.remoteAddr = remoteAddr;
+    c.remotePort = remotePort;
+    c.inode = inode;
+    return c;
+}
+
+ProcessInfo makeProc(int pid, const std::string& name) {
+    ProcessInfo p;
+    p.pid = pid;
+    p.name = name;
+    return p;
+}
+
+}  // namespace
+
+TEST(Feed, EndpointFormatting) {
+    EXPECT_EQ(endpoint("127.0.0.1", 8080), "127.0.0.1:8080");
+    EXPECT_EQ(endpoint("::1", 8080), "[::1]:8080");   // IPv6 gets brackets
+}
+
+TEST(Feed, LoopbackDetection) {
+    EXPECT_TRUE(isLoopbackAddress("127.0.0.1"));
+    EXPECT_TRUE(isLoopbackAddress("127.1.2.3"));
+    EXPECT_TRUE(isLoopbackAddress("::1"));
+    EXPECT_TRUE(isLoopbackAddress("::ffff:127.0.0.1"));
+    EXPECT_FALSE(isLoopbackAddress("10.0.0.5"));
+    EXPECT_FALSE(isLoopbackAddress("1.127.0.0"));   // "127." must be at the START
+    EXPECT_FALSE(isLoopbackAddress("::"));
+}
+
+TEST(Feed, FirstSampleIsOnlyABaseline) {
+    ChangeDetector d;
+    // Even a wide-open listener is not reported on the very first sample.
+    auto changes = d.checkConnections({makeConn("LISTEN", "0.0.0.0", 8080, "0.0.0.0", 0)});
+    EXPECT_TRUE(changes.empty());
+}
+
+TEST(Feed, NewListenerOnAllInterfacesIsAWarning) {
+    ChangeDetector d;
+    d.checkConnections({});   // baseline: nothing yet
+    auto changes = d.checkConnections({makeConn("LISTEN", "0.0.0.0", 8080, "0.0.0.0", 0)});
+    ASSERT_EQ(changes.size(), 1u);
+    EXPECT_EQ(changes[0].level, LogLevel::Warning);
+    EXPECT_NE(changes[0].message.find("0.0.0.0:8080"), std::string::npos);
+}
+
+TEST(Feed, NewLoopbackListenerIsOnlyInfo) {
+    ChangeDetector d;
+    d.checkConnections({});
+    auto changes = d.checkConnections({makeConn("LISTEN", "127.0.0.1", 41789, "0.0.0.0", 0)});
+    ASSERT_EQ(changes.size(), 1u);
+    EXPECT_EQ(changes[0].level, LogLevel::Info);
+}
+
+TEST(Feed, ClosedListenerIsReported) {
+    ChangeDetector d;
+    d.checkConnections({});
+    d.checkConnections({makeConn("LISTEN", "0.0.0.0", 8080, "0.0.0.0", 0)});
+    auto changes = d.checkConnections({});   // the listener is gone
+    ASSERT_EQ(changes.size(), 1u);
+    EXPECT_NE(changes[0].message.find("closed"), std::string::npos);
+    EXPECT_NE(changes[0].message.find("0.0.0.0:8080"), std::string::npos);
+}
+
+TEST(Feed, UnchangedStateProducesNothing) {
+    ChangeDetector d;
+    std::vector<Connection> same = {
+        makeConn("LISTEN", "0.0.0.0", 22, "0.0.0.0", 0),
+        makeConn("ESTABLISHED", "10.0.0.2", 40000, "20.1.2.3", 443),
+    };
+    d.checkConnections(same);                       // baseline
+    EXPECT_TRUE(d.checkConnections(same).empty());  // identical sample: no changes
+}
+
+TEST(Feed, NewOutboundConnectionIsReportedWithItsInode) {
+    ChangeDetector d;
+    d.checkConnections({});
+    auto changes = d.checkConnections({
+        makeConn("ESTABLISHED", "10.0.0.2", 40000, "20.233.83.145", 22, 777)});
+    ASSERT_EQ(changes.size(), 1u);
+    EXPECT_NE(changes[0].message.find("outbound"), std::string::npos);
+    EXPECT_NE(changes[0].message.find("20.233.83.145:22"), std::string::npos);
+    EXPECT_EQ(changes[0].inode, 777u);   // so the caller can look up the owning process
+}
+
+TEST(Feed, ManySocketsToTheSameServerCountOnce) {
+    ChangeDetector d;
+    d.checkConnections({});
+    auto changes = d.checkConnections({
+        makeConn("ESTABLISHED", "10.0.0.2", 40001, "20.1.2.3", 443),
+        makeConn("ESTABLISHED", "10.0.0.2", 40002, "20.1.2.3", 443),   // same destination
+        makeConn("ESTABLISHED", "10.0.0.2", 40003, "20.1.2.3", 443),
+    });
+    EXPECT_EQ(changes.size(), 1u);
+}
+
+TEST(Feed, LoopbackConnectionsAreIgnored) {
+    ChangeDetector d;
+    d.checkConnections({});
+    auto changes = d.checkConnections({
+        makeConn("ESTABLISHED", "127.0.0.1", 39215, "127.0.0.1", 42052)});
+    EXPECT_TRUE(changes.empty());
+}
+
+TEST(Feed, ConnectionToOneOfOurListeningPortsIsInbound) {
+    ChangeDetector d;
+    Connection listener = makeConn("LISTEN", "0.0.0.0", 22, "0.0.0.0", 0);
+    d.checkConnections({listener});   // baseline: just the listener
+
+    auto changes = d.checkConnections({
+        listener,
+        makeConn("ESTABLISHED", "10.0.0.2", 22, "10.0.0.9", 50000)});
+    ASSERT_EQ(changes.size(), 1u);
+    EXPECT_NE(changes[0].message.find("inbound"), std::string::npos);
+    EXPECT_NE(changes[0].message.find("10.0.0.9"), std::string::npos);
+}
+
+TEST(Feed, ResettingStartsANewBaseline) {
+    ChangeDetector d;
+    d.checkConnections({});
+    d.resetConnections();   // as if the NETWORK SCAN chip was removed and reinstalled
+    auto changes = d.checkConnections({makeConn("LISTEN", "0.0.0.0", 8080, "0.0.0.0", 0)});
+    EXPECT_TRUE(changes.empty());   // no flood: this sample is a baseline again
+}
+
+TEST(Feed, NewProgramIsReportedOnlyTheFirstTime) {
+    ChangeDetector d;
+    d.checkProcesses({makeProc(1, "systemd"), makeProc(2, "bash")});   // baseline
+
+    // The same programs again: nothing to report, even with different pids.
+    EXPECT_TRUE(d.checkProcesses({makeProc(1, "systemd"), makeProc(50, "bash")}).empty());
+
+    auto changes = d.checkProcesses({makeProc(1, "systemd"), makeProc(9, "nc")});
+    ASSERT_EQ(changes.size(), 1u);
+    EXPECT_NE(changes[0].message.find("nc"), std::string::npos);
+    EXPECT_NE(changes[0].message.find("pid 9"), std::string::npos);
+
+    // "nc" is known now, so a second one is not news.
+    EXPECT_TRUE(d.checkProcesses({makeProc(10, "nc")}).empty());
+}
+
+TEST(Feed, ResettingProcessesStartsANewBaseline) {
+    ChangeDetector d;
+    d.checkProcesses({makeProc(1, "bash")});
+    d.resetProcesses();
+    EXPECT_TRUE(d.checkProcesses({makeProc(1, "bash"), makeProc(2, "nc")}).empty());
+}
+
+TEST(Feed, LimitKeepsWarningsAndSummarizesTheRest) {
+    std::vector<Change> changes;
+    for (int i = 0; i < 6; ++i) {
+        changes.push_back({LogLevel::Info, "info " + std::to_string(i), 0});
+    }
+    changes.push_back({LogLevel::Warning, "important", 0});   // added LAST on purpose
+
+    limitChanges(changes, 3);
+
+    ASSERT_EQ(changes.size(), 4u);                 // 3 kept + 1 summary line
+    EXPECT_EQ(changes[0].message, "important");    // the warning survived the cut
+    EXPECT_NE(changes[3].message.find("4 more"), std::string::npos);   // 7 total - 3 kept
+}
+
+TEST(Feed, LimitDoesNothingWhenUnderTheCap) {
+    std::vector<Change> changes = {{LogLevel::Info, "one", 0}, {LogLevel::Info, "two", 0}};
+    limitChanges(changes, 5);
+    EXPECT_EQ(changes.size(), 2u);
+}
+
+TEST(Feed, ProcessNamesAreSanitized) {
+    // A newline in a process name could forge a fake log line.
+    EXPECT_EQ(sanitizeName("evil\n2026-01-01 [ERROR] fake"), "evil?2026-01-01 [ERROR] fake");
+    EXPECT_EQ(sanitizeName("tab\there"), "tab?here");
+    EXPECT_EQ(sanitizeName("plain-name_1"), "plain-name_1");
+    EXPECT_EQ(sanitizeName("Şiro"), "Şiro");   // non-ASCII bytes are left alone
 }

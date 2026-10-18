@@ -25,4 +25,8 @@ std::string stateName(unsigned long code);
 // Splits "0100007F:1F90" into "127.0.0.1" and 8080. Returns false for malformed text.
 bool parseEndpoint(const std::string& text, std::string& addr, unsigned int& port);
 
+// "127.0.0.1" + 8080 -> "127.0.0.1:8080", and "::1" + 8080 -> "[::1]:8080".
+// IPv6 addresses contain ':' themselves, so they are wrapped in brackets.
+std::string endpoint(const std::string& addr, unsigned int port);
+
 std::vector<Connection> readConnections();

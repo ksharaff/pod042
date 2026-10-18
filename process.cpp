@@ -46,7 +46,7 @@ bool readStat(int pid, std::string& name, unsigned long long& ticks) {
     if (open == std::string::npos || close == std::string::npos || close < open) {
         return false;
     }
-    name = line.substr(open + 1, close - open - 1);
+    name = sanitizeName(line.substr(open + 1, close - open - 1));
 
     // Everything after ")" is plain space-separated numbers (and the state letter).
     std::istringstream iss(line.substr(close + 1));
@@ -83,7 +83,7 @@ std::string readComm(int pid) {
     std::ifstream file("/proc/" + std::to_string(pid) + "/comm");
     std::string name;
     std::getline(file, name);
-    return name;                // empty if we couldn't read it
+    return sanitizeName(name);   // empty if we couldn't read it
 }
 
 }  // namespace
@@ -233,4 +233,14 @@ std::map<unsigned long long, SocketOwner> readSocketOwners() {
         }
     }
     return owners;
+}
+
+std::string sanitizeName(std::string name) {
+    for (char& ch : name) {   // "char&" = a reference, so assigning to ch edits the string
+        unsigned char u = static_cast<unsigned char>(ch);
+        if (u < 0x20 || u == 0x7F) {   // control characters
+            ch = '?';
+        }
+    }
+    return name;   // bytes >= 0x80 stay, so non-English names still work
 }

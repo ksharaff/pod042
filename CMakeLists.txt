@@ -50,7 +50,7 @@ endfunction()
 add_library(pod042_core STATIC
     meminfo.cpp cpu.cpp disk.cpp net.cpp log.cpp chips.cpp
     loadout.cpp profile.cpp connections.cpp process.cpp
-    snapshot.cpp pod.cpp)
+    snapshot.cpp pod.cpp changes.cpp)
 
 # PUBLIC = anything that links this library also gets these settings.
 # The headers sit in the project folder, so the tests can write #include "cpu.h".

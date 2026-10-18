@@ -161,6 +161,13 @@ bool parseEndpoint(const std::string& text, std::string& addr, unsigned int& por
     return true;
 }
 
+std::string endpoint(const std::string& addr, unsigned int port) {
+    if (addr.find(':') != std::string::npos) {
+        return "[" + addr + "]:" + std::to_string(port);
+    }
+    return addr + ":" + std::to_string(port);
+}
+
 std::vector<Connection> readConnections() {
     std::vector<Connection> result;
     readTcpFile("/proc/net/tcp", result);    // IPv4
