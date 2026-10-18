@@ -33,6 +33,7 @@
 #include "meminfo.h"
 #include "net.h"
 #include "profile.h"
+#include "connections.h"
 
 using namespace ftxui;
 
@@ -84,6 +85,23 @@ std::string toUpper(std::string s) {
         c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
     }
     return s;
+}
+
+// "127.0.0.1" + 8080 -> "127.0.0.1:8080"
+std::string endpoint(const std::string& addr, unsigned int port) {
+    return addr + ":" + std::to_string(port);
+}
+
+// Formats one table row with fixed-width columns.
+// "%-12s" means: print a string, left-aligned, padded with spaces to 12 characters.
+// The terminal uses a monospaced font, so padded text lines up as a table.
+// .c_str() gives the C-style text that snprintf's %s expects.
+std::string formatRow(const std::string& state, const std::string& local,
+                      const std::string& remote) {
+    char buf[128];
+    std::snprintf(buf, sizeof(buf), "%-12s %-24s %-24s",
+                  state.c_str(), local.c_str(), remote.c_str());
+    return buf;
 }
 // ----------------------------------------------------------------------------
 // meter(): draws one row like   CPU   [#######     ]  42.0%
@@ -420,7 +438,7 @@ int main(int argc, char** argv) {
 
     // Left menu: list of screens. "tab" holds the selected index
     // menu stores the address of "tab" and updates it as you move
-    std::vector<std::string> tabNames = {"SYSTEM STATUS", "CHIP CONFIGURATION", "SYSTEM LOGS"};
+    std::vector<std::string> tabNames = {"SYSTEM STATUS","NETWORK CONNECTIONS", "CHIP CONFIGURATION", "SYSTEM LOGS"};
     int tab = 0;
     Component tabMenu = Menu(&tabNames, &tab, MenuOption::Vertical());
 
@@ -428,6 +446,65 @@ int main(int argc, char** argv) {
     // This lambda runs every time the screen is redrawn
     Component statusView = Renderer([&] {
         return statusPanel(snapshotTelemetry(), diskEnabled, netEnabled);
+    });
+
+    // Screen: network connections. Only works if the NETWORK SCAN chip is installed.
+    // It reads /proc/net/tcp directly each time it's drawn. That's cheap, and it
+    // keeps this screen free of shared state, so no mutex is needed.
+    Component connectionsView = Renderer([&]() -> Element {
+        if (!netEnabled) {
+            return vbox({
+                text("NETWORK CONNECTIONS") | bold,
+                separator(),
+                text(kChipNetwork + " CHIP NOT INSTALLED") | color(kAmber),
+                text("Install it on the CHIP CONFIGURATION screen.") | dim,
+            });
+        }
+
+        std::vector<Connection> conns = readConnections();
+
+        // Count a few states for the summary line.
+        std::size_t established = 0;
+        std::size_t listening = 0;
+        for (const Connection& c : conns) {
+            if (c.state == "ESTABLISHED") ++established;
+            if (c.state == "LISTEN")      ++listening;
+        }
+
+        Elements rows;
+        rows.push_back(text("NETWORK CONNECTIONS") | bold);
+        rows.push_back(separator());
+        rows.push_back(text("ESTABLISHED: " + std::to_string(established) +
+                            "   LISTENING: " + std::to_string(listening) +
+                            "   TOTAL: " + std::to_string(conns.size())));
+        rows.push_back(separator());
+        rows.push_back(text(formatRow("STATE", "LOCAL", "REMOTE")) | dim);
+
+        const std::size_t maxRows = 15;   // keep the table inside the window
+        std::size_t shown = 0;
+        for (const Connection& c : conns) {
+            if (shown >= maxRows) break;
+
+            Element row = text(formatRow(c.state,
+                                         endpoint(c.localAddr, c.localPort),
+                                         endpoint(c.remoteAddr, c.remotePort)));
+
+            // A LISTEN socket bound to 0.0.0.0 accepts connections on EVERY network
+            // interface, so it's reachable from outside this machine. That deserves
+            // a visual flag. A socket bound to 127.0.0.1 only accepts local traffic.
+            if (c.state == "LISTEN" && c.localAddr == "0.0.0.0") {
+                row = row | color(kAmber);
+            }
+            rows.push_back(row);
+            ++shown;
+        }
+
+        if (conns.size() > shown) {
+            rows.push_back(text("... +" + std::to_string(conns.size() - shown) + " more") | dim);
+        }
+        rows.push_back(separator());
+        rows.push_back(text("AMBER = LISTENING ON ALL INTERFACES (0.0.0.0)") | dim);
+        return vbox(std::move(rows));
     });
 
     // Screen 2: chips
@@ -470,7 +547,7 @@ int main(int argc, char** argv) {
     });
     // Container::Tab holds several components but shows only the one at index
     // "tab" (the left menu's selection).
-    Component tabs = Container::Tab({statusView, chipsView, logsView}, &tab);
+    Component tabs = Container::Tab({statusView, connectionsView, chipsView, logsView}, &tab);
 
     // Container::Horizontal groups the left menu and the right panel, so
     // Left/Right arrow keys move focus between them.
