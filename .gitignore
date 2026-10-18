@@ -71,3 +71,6 @@ pod042.log
 
 loadout.json
 profile.json
+
+build-asan/
+sanitizer.log

@@ -2,6 +2,11 @@
 #include <vector>
 #include <string>
 
+inline const std::string kChipNetwork = "NETWORK SCAN";
+inline const std::string kChipDisk    = "DISK MONITOR";
+inline const std::string kChipLog     = "LOG STREAM";
+inline const std::string kChipProcess = "PROCESS WATCH";
+
 using namespace std;
 
 struct Chip {

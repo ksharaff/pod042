@@ -37,20 +37,21 @@
 #include "profile.h"
 #include "connections.h"
 #include "process.h"
+#include "snapshot.h"
+#include "pod.h"
 
 using namespace ftxui;
 
 // warning color
 const Color kAmber = Color::RGB(255, 176, 0);
 
-// gauge turns into color at or above this number
-const double kWarnFraction = 0.8;
-
-const std::string kChipNetwork = "NETWORK SCAN";
-const std::string kChipDisk = "DISK MONITOR";
-const std::string kChipLog = "LOG STREAM";
-const std::string kChipProcess = "PROCESS WATCH";
+const double kWarnFraction = 0.8; // gauge turns into color at or above this number
 const std::size_t kMaxProcessRows = 12; // How many processes the screen shows (also limits what we copy around each second).
+
+const int kTabChips = 3; // loadout presets
+
+const int kHeartbeatSeconds = 60;
+
 
 
 struct Telemetry {
@@ -97,6 +98,9 @@ std::string toUpper(std::string s) {
 
 // "127.0.0.1" + 8080 -> "127.0.0.1:8080"
 std::string endpoint(const std::string& addr, unsigned int port) {
+    if (addr.find(':') != std::string::npos) {
+        return "[" + addr + "]:" + std::to_string(port);
+    }
     return addr + ":" + std::to_string(port);
 }
 
@@ -106,8 +110,8 @@ std::string endpoint(const std::string& addr, unsigned int port) {
 // .c_str() gives the C-style text that snprintf's %s expects.
 std::string formatRow(const std::string& state, const std::string& local,
                       const std::string& remote, const std::string& owner) {
-    char buf[160];
-    std::snprintf(buf, sizeof(buf), "%-12s %-22s %-22s %s",
+    char buf[200];
+    std::snprintf(buf, sizeof(buf), "%-12s %-30s %-30s %s",
                   state.c_str(), local.c_str(), remote.c_str(), owner.c_str());
     return buf;
 }
@@ -229,6 +233,19 @@ std::vector<std::string> readLogTail(const std::string& path, std::size_t count)
 // =====================================================
 
 int main(int argc, char** argv) {
+    // --json: print ONE snapshot as JSON and exit. No prompt, no UI, so other
+    // programs (scripts, a future web frontend) can read the output.
+    for (int i = 1; i < argc; ++i) {
+        if (std::string(argv[i]) == "--json") {
+            ChipManager chips(4);
+            if (!loadLoadout(chips, "loadout.json")) {
+                applyDefaultLoadout(chips);   // defined in Part C below
+            }
+            std::cout << takeSnapshotJson(chips) << "\n";
+            return 0;
+        }
+    }
+
     logEvent(LogLevel::Info, "POD-042 Booting");
 
     // "./build/pod042 --rename" forces the name prompt again.
@@ -258,9 +275,8 @@ int main(int argc, char** argv) {
 
     // try to restore the saved loadout; on the first run there's no file yet.
     if (!loadLoadout(chips, "loadout.json")) {
-        chips.enable("NETWORK SCAN");   // default loadout: 2 of 4 slots
-        chips.enable("LOG STREAM");
-}
+        applyDefaultLoadout(chips);   // first run: no saved loadout yet
+    }
 
     std::vector<std::string> chipLabels; // text of each menu line
     int chipSelected = 0; // index of highlighted chip
@@ -308,6 +324,18 @@ int main(int argc, char** argv) {
 
     };
 
+        // Switches to the preset at "index" (0 = first preset), then saves the result.
+    auto selectPreset = [&](std::size_t index) {
+        const std::vector<Preset>& all = presets();
+        if (index >= all.size()) {
+            return;   // a key like "7" when only 3 presets exist: ignore it
+        }
+        applyPreset(chips, all[index].name);
+        chipMessage = "LOADOUT: " + all[index].name;
+        updateLabels();                      // refreshes the menu text and the chip flags
+        saveLoadout(chips, "loadout.json");
+    };
+
     // =====================================================
     // 2. TELEMETRY
     // =====================================================
@@ -346,6 +374,10 @@ int main(int argc, char** argv) {
         bool cpuAlertActive = false;
 
         bool netPrimed = false;
+
+        // For the Pod heartbeat
+        const auto startTime = std::chrono::steady_clock::now();
+        auto lastHeartbeat = startTime;
 
         while(running) {
             // sleep 1 second
@@ -415,6 +447,17 @@ int main(int argc, char** argv) {
                 logEvent(LogLevel::Info, "CPU usage back to normal");
             }
             cpuAlertActive = cpuHigh;
+
+            // Pod heartbeat: once every kHeartbeatSeconds, one line in the log.
+            if (nowTime - lastHeartbeat >= std::chrono::seconds(kHeartbeatSeconds)) {
+                double memPercent = t.mem.totalKb > 0
+                    ? 100.0 * static_cast<double>(t.mem.totalKb - t.mem.availableKb) /
+                          static_cast<double>(t.mem.totalKb)
+                    : 0.0;
+                double uptime = std::chrono::duration<double>(nowTime - startTime).count();
+                logEvent(LogLevel::Info, podHeartbeat(t.cpuPercent, memPercent, uptime));
+                lastHeartbeat = nowTime;
+            }
 
             {
                 std::lock_guard<std::mutex> lock(telemtryMutex);
@@ -563,7 +606,7 @@ int main(int argc, char** argv) {
             // A LISTEN socket bound to 0.0.0.0 accepts connections on EVERY network
             // interface, so it's reachable from outside this machine. That deserves
             // a visual flag. A socket bound to 127.0.0.1 only accepts local traffic.
-            if (c.state == "LISTEN" && c.localAddr == "0.0.0.0") {
+            if (c.state == "LISTEN" && (c.localAddr == "0.0.0.0" || c.localAddr == "::")) {
                 row = row | color(kAmber);
             }
             rows.push_back(row);
@@ -574,7 +617,7 @@ int main(int argc, char** argv) {
             rows.push_back(text("... +" + std::to_string(conns.size() - shown) + " more") | dim);
         }
         rows.push_back(separator());
-                rows.push_back(text("AMBER = LISTENING ON ALL INTERFACES (0.0.0.0).  ? = OWNER NOT VISIBLE WITHOUT ROOT") | dim);
+        rows.push_back(text("AMBER = LISTENING ON ALL INTERFACES (0.0.0.0 / ::).  ? = OWNER NOT VISIBLE WITHOUT ROOT") | dim);
         return vbox(std::move(rows));
     });
 
@@ -627,17 +670,28 @@ int main(int argc, char** argv) {
         double used = chips.usedSlots();
         double total = chips.totalSlots();
         const Chip& selected = chips.chips()[static_cast<std::size_t>(chipSelected)];
+
+        // Build "PRESETS:  [1] DIAGNOSTIC  [2] EXPLORATION  [3] SECURITY" from the
+        // preset list, so adding a preset in loadout.cpp updates the screen too.
+        std::string presetLine = "PRESETS:";
+        const std::vector<Preset>& all = presets();
+        for (std::size_t i = 0; i < all.size(); ++i) {
+            presetLine += "  [" + std::to_string(i + 1) + "] " + all[i].name;
+        }
+
         return vbox({
             text("CHIP CONFIGURATION") | bold,
             separator(),
             meter("SLOTS", total > 0 ? used / total : 0.0,
-                std::to_string(chips.usedSlots()) + "/" + std::to_string(chips.totalSlots())),
+                  std::to_string(chips.usedSlots()) + "/" + std::to_string(chips.totalSlots())),
             separator(),
-            chipMenu->Render(), // list of chips
+            chipMenu->Render(),
             separator(),
-            text(selected.description) | dim, // dim = fainter text style
+            text(selected.description) | dim,
             text(chipMessage) | bold | color(kAmber),
-            text("RIGHT: focus list ENTER: install / remove") | dim,
+            separator(),
+            text(presetLine),
+            text("RIGHT: focus list   ENTER: install / remove   1-3: load preset") | dim,
         });
     });
 
@@ -702,6 +756,16 @@ int main(int argc, char** argv) {
             booting = false;
             return true;
         }
+
+        // On the chip screen, keys 1..9 load the matching preset.
+        if (tab == kTabChips && event.is_character()) {
+            char key = event.character()[0];
+            if (key >= '1' && key <= '9') {
+                selectPreset(static_cast<std::size_t>(key - '1'));   // '1' -> 0, '2' -> 1, ...
+                return true;   // handled: the key does nothing else
+            }
+        }
+        
         if(event==Event::Character('q') || event==Event::Character('Q')) {
             screen.ExitLoopClosure()();
             return true;

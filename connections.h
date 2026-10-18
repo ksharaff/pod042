@@ -13,5 +13,16 @@ struct Connection {
     
     unsigned long long inode = 0;   // socket id; used to find the owning process
 };
+// 0x0100007F -> "127.0.0.1" (the kernel prints the 4 IP bytes in little-endian order).
+std::string hexToIp(unsigned long value);
+
+// "00000000000000000000000001000000" -> "::1". Returns "" if the text isn't 32 hex digits.
+std::string hexToIp6(const std::string& hex);
+
+// 0x01 -> "ESTABLISHED", 0x0A -> "LISTEN", anything unknown -> "UNKNOWN".
+std::string stateName(unsigned long code);
+
+// Splits "0100007F:1F90" into "127.0.0.1" and 8080. Returns false for malformed text.
+bool parseEndpoint(const std::string& text, std::string& addr, unsigned int& port);
 
 std::vector<Connection> readConnections();
