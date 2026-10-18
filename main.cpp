@@ -52,6 +52,10 @@ const int kTabChips = 3; // loadout presets
 
 const int kHeartbeatSeconds = 60;
 
+// Typewriter timing for the boot sequence. Raise them to type slower.
+const int kCharDelayMs = 30;
+const int kLinePauseMs = 200;   
+
 
 
 struct Telemetry {
@@ -86,6 +90,15 @@ std::string trim(const std::string& s) {
     }
     std::size_t end = s.find_last_not_of(whitespace);
     return s.substr(start, end - start + 1);   // substr(startPosition, length)
+}
+
+
+std::size_t nextCharEnd(const std::string& s, std::size_t pos) {
+    ++pos;   // always step over the first byte
+    while (pos < s.size() && (static_cast<unsigned char>(s[pos]) & 0xC0) == 0x80) {
+        ++pos;
+    }
+    return pos;
 }
 
 
@@ -485,41 +498,79 @@ int main(int argc, char** argv) {
         "ALL SYSTEMS NOMINAL. WELCOME, " + toUpper(userName) + ".",
     };
 
-    // both are atomic bevause the boot thread writes them while UI reads them
-    std::atomic<bool> booting{true}; // true until seq ends or user skips
-    std::atomic<std::size_t> bootShown{0}; // counts how many lines are visible so far.
+        std::atomic<bool> booting{true};
 
-    // sleeps for ms but wakes early if user skips or quits
-    // it sleeps imn 50 ms slices so reaction is almost instant
+    
+    std::atomic<std::size_t> bootChars{0};
+
+    // Total size of the boot text, used for the progress bar.
+    std::size_t totalBootChars = 0;
+    for (const std::string& line : bootLines) {
+        totalBootChars += line.size();
+    }
+
+    // Sleeps "ms" milliseconds in 10 ms slices; wakes early on skip or quit.
+    // Slices must be shorter than the per-character delay, or the typing speed
+    // would be rounded up to the slice length.
     auto nap = [&](int ms) {
-        for(int i=0; i < ms && booting && running; i+=50) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        for (int waited = 0; waited < ms && booting && running; waited += 10) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
         }
     };
 
-    // boot thread reveals one line at a time
+    // The boot thread "types" the text one character at a time.
     std::thread bootThread([&] {
-        for(std::size_t i = 0; i < bootLines.size() && booting && running; ++i) {
-            nap(450);
-            bootShown = i+1; // reveal next line
-            screen.PostEvent(Event::Custom); // redraw
+        std::size_t revealed = 0;   // bytes shown so far
+
+        for (const std::string& line : bootLines) {
+            std::size_t pos = 0;    // position inside this line
+            while (pos < line.size() && booting && running) {
+                std::size_t next = nextCharEnd(line, pos);   // one whole character
+                revealed += next - pos;
+                pos = next;
+
+                bootChars = revealed;
+                screen.PostEvent(Event::Custom);   // redraw
+                nap(kCharDelayMs);
+            }
+            nap(kLinePauseMs);   // short pause once a line is complete
         }
-        nap(700); // pause on final line
-        booting = false; // switch to main UI
+
+        nap(700);              // pause on the finished screen
+        booting = false;       // switch to the main UI
         screen.PostEvent(Event::Custom);
     });
 
     auto bootScreen = [&]() -> Element {
-        std::size_t shown = bootShown; // read atomic once then reuse
+        const std::size_t shown = bootChars;   // read the atomic once, then reuse it
 
         Elements rows;
         rows.push_back(text("YoRHa // BOOT SEQUENCE") | bold);
         rows.push_back(separator());
-        for(std::size_t i=0;i<shown && i<bootLines.size(); ++i) {
-            rows.push_back(text(bootLines[i]));
+
+        // Walk the lines, spending the revealed characters on each one:
+        //   enough left for the whole line -> draw it, subtract its length
+        //   not enough                      -> draw the first part plus a cursor, stop
+        std::size_t remaining = shown;
+        for (const std::string& line : bootLines) {
+            if (remaining == 0) {
+                break;   // nothing left to show for this or any later line
+            }
+            if (remaining >= line.size()) {
+                rows.push_back(text(line));
+                remaining -= line.size();
+            } else {
+                // "█" is a block cursor at the point where typing currently is.
+                rows.push_back(text(line.substr(0, remaining) + "█"));
+                remaining = 0;
+            }
         }
+        if (shown == 0) {
+            rows.push_back(text("█"));   // before the first character, show only the cursor
+        }
+
         rows.push_back(separator());
-        rows.push_back(gauge(static_cast<float>(shown) / static_cast<float>(bootLines.size())));
+        rows.push_back(gauge(static_cast<float>(shown) / static_cast<float>(totalBootChars)));
         rows.push_back(text("PRESS ANY KEY TO SKIP") | dim);
 
         return vbox(std::move(rows)) | border | size(WIDTH, EQUAL, 56) | center;
