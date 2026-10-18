@@ -22,6 +22,7 @@
 #include "profile.h"
 #include "changes.h"
 #include "process.h"
+#include "knownprograms.h"
 
 // Helpers private to this file.
 namespace {
@@ -484,4 +485,106 @@ TEST(Feed, ProcessNamesAreSanitized) {
     EXPECT_EQ(sanitizeName("tab\there"), "tab?here");
     EXPECT_EQ(sanitizeName("plain-name_1"), "plain-name_1");
     EXPECT_EQ(sanitizeName("Şiro"), "Şiro");   // non-ASCII bytes are left alone
+}
+
+// ---------------------------------------------------------------------------
+// Known programs: remembering names between runs
+// ---------------------------------------------------------------------------
+
+TEST(KnownPrograms, LoadedNamesAreNotReportedButNewOnesAreImmediately) {
+    ChangeDetector d;
+    d.loadKnownPrograms({"bash", "systemd"});
+
+    // No separate baseline sample: the loaded list IS the baseline.
+    auto changes = d.checkProcesses({makeProc(1, "systemd"), makeProc(2, "bash"), makeProc(9, "nc")});
+    ASSERT_EQ(changes.size(), 1u);
+    EXPECT_NE(changes[0].message.find("nc"), std::string::npos);
+}
+
+TEST(KnownPrograms, EmptyLoadedListStillStartsWithAQuietBaseline) {
+    ChangeDetector d;
+    d.loadKnownPrograms({});   // like a first run: nothing saved yet
+    EXPECT_TRUE(d.checkProcesses({makeProc(1, "bash"), makeProc(2, "nc")}).empty());
+    EXPECT_EQ(d.knownPrograms().size(), 2u);   // both are remembered, for saving
+}
+
+TEST(KnownPrograms, ResetKeepsKnownNamesButRestartsTheBaseline) {
+    ChangeDetector d;
+    d.loadKnownPrograms({"bash"});
+    d.resetProcesses();   // as if the PROCESS WATCH chip was removed and reinstalled
+
+    // The first sample after the reset is quiet, even for a name not in the list...
+    EXPECT_TRUE(d.checkProcesses({makeProc(1, "bash"), makeProc(2, "nc")}).empty());
+    // ...and everything stays known afterwards.
+    EXPECT_EQ(d.knownPrograms().count("bash"), 1u);
+    EXPECT_EQ(d.knownPrograms().count("nc"), 1u);
+    EXPECT_TRUE(d.checkProcesses({makeProc(3, "nc")}).empty());
+    EXPECT_EQ(d.checkProcesses({makeProc(4, "brandnew")}).size(), 1u);
+}
+
+TEST(KnownPrograms, ListHasACeilingAndWarnsOnlyOnce) {
+    std::set<std::string> full;
+    for (std::size_t i = 0; i < kMaxKnownPrograms; ++i) {
+        full.insert("prog" + std::to_string(i));
+    }
+    ChangeDetector d;
+    d.loadKnownPrograms(full);
+
+    auto changes = d.checkProcesses({makeProc(1, "overflow1")});
+    ASSERT_EQ(changes.size(), 1u);
+    EXPECT_EQ(changes[0].level, LogLevel::Warning);
+    EXPECT_NE(changes[0].message.find("full"), std::string::npos);
+    EXPECT_EQ(d.knownPrograms().size(), kMaxKnownPrograms);   // the new name was NOT added
+
+    // A second unknown name: no second warning, and still not added.
+    EXPECT_TRUE(d.checkProcesses({makeProc(2, "overflow2")}).empty());
+    EXPECT_EQ(d.knownPrograms().size(), kMaxKnownPrograms);
+}
+
+TEST(KnownPrograms, SaveThenLoadRoundTrip) {
+    const std::string path = tempFile("pod042_test_known.json");
+    std::filesystem::remove(path);
+
+    ASSERT_TRUE(saveKnownPrograms({"bash", "nc", "sshd"}, path));
+    std::set<std::string> loaded = loadKnownPrograms(path);
+    EXPECT_EQ(loaded, (std::set<std::string>{"bash", "nc", "sshd"}));
+
+    // The temporary file used for the safe write must not be left behind.
+    EXPECT_FALSE(std::filesystem::exists(path + ".tmp"));
+
+    std::filesystem::remove(path);
+}
+
+TEST(KnownPrograms, MissingFileGivesAnEmptyList) {
+    const std::string path = tempFile("pod042_test_known_missing.json");
+    std::filesystem::remove(path);
+    EXPECT_TRUE(loadKnownPrograms(path).empty());
+}
+
+TEST(KnownPrograms, BrokenOrWrongShapeFilesGiveAnEmptyList) {
+    const std::string path = tempFile("pod042_test_known_broken.json");
+
+    writeFile(path, "{ not json");
+    EXPECT_TRUE(loadKnownPrograms(path).empty());
+
+    writeFile(path, R"({"programs": "oops"})");   // should be an array
+    EXPECT_TRUE(loadKnownPrograms(path).empty());
+
+    writeFile(path, R"(["bash", "nc"])");         // an array, but not an object with "programs"
+    EXPECT_TRUE(loadKnownPrograms(path).empty());
+
+    std::filesystem::remove(path);
+}
+
+TEST(KnownPrograms, LoadSkipsNonStringsAndCleansNames) {
+    const std::string path = tempFile("pod042_test_known_mixed.json");
+    // A hand-edited file: a number, null, and a name containing a newline escape.
+    writeFile(path, R"({"programs": ["bash", 42, null, "evil\nname"]})");
+
+    std::set<std::string> loaded = loadKnownPrograms(path);
+    EXPECT_EQ(loaded.count("bash"), 1u);
+    EXPECT_EQ(loaded.count("evil?name"), 1u);   // the newline became '?'
+    EXPECT_EQ(loaded.size(), 2u);               // 42 and null were skipped
+
+    std::filesystem::remove(path);
 }

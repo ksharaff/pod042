@@ -18,6 +18,7 @@
 #include <map>
 #include <set>
 #include <algorithm>
+#include <filesystem>
 
 
 
@@ -42,6 +43,7 @@
 #include "snapshot.h"
 #include "pod.h"
 #include "changes.h"
+#include "knownprograms.h"
 
 using namespace ftxui;
 
@@ -59,6 +61,8 @@ const std::size_t kMaxChangesPerSample = 5;
 // Typewriter timing for the boot sequence. Raise them to type slower.
 const int kCharDelayMs = 30;
 const int kLinePauseMs = 200;   
+
+const std::string kKnownProgramsFile = "known_programs.json";
 
 
 
@@ -242,15 +246,24 @@ std::vector<std::string> readLogTail(const std::string& path, std::size_t count)
 // =====================================================
 
 int main(int argc, char** argv) {
-    // --json: print ONE snapshot as JSON and exit. No prompt, no UI, so other
-    // programs (scripts, a future web frontend) can read the output.
     for (int i = 1; i < argc; ++i) {
+        // --json: print ONE snapshot as JSON and exit. No prompt, no UI.
         if (std::string(argv[i]) == "--json") {
             ChipManager chips(4);
             if (!loadLoadout(chips, "loadout.json")) {
-                applyDefaultLoadout(chips);   // defined in Part C below
+                applyDefaultLoadout(chips);
             }
             std::cout << takeSnapshotJson(chips) << "\n";
+            return 0;
+        }
+
+        // --forget-programs: delete the saved list of known programs and exit.
+        // The next run starts from a fresh, silent baseline.
+        if (std::string(argv[i]) == "--forget-programs") {
+            std::error_code ec;   // remove() reports problems through "ec" instead of throwing
+            const bool removed = std::filesystem::remove(kKnownProgramsFile, ec);
+            std::cout << (removed ? "Known-program list cleared.\n"
+                                  : "No known-program list to clear.\n");
             return 0;
         }
     }
@@ -386,6 +399,9 @@ int main(int argc, char** argv) {
         auto lastHeartbeat = startTime;
 
         ChangeDetector detector;   // remembers the previous sample for the event feed
+
+        detector.loadKnownPrograms(loadKnownPrograms(kKnownProgramsFile));
+        std::size_t savedProgramCount = detector.knownPrograms().size();
         // Writes detected changes to the log. Every check below passes its result through here.
         auto publish = [&](std::vector<Change> changes) {
             if (changes.empty()) {
@@ -457,6 +473,11 @@ int main(int argc, char** argv) {
                 std::vector<ProcessInfo> procs = processSampler.sample(nowCpu);
                 t.processCount = procs.size();
                 publish(detector.checkProcesses(procs));   // log programs seen for the first time
+
+                if (detector.knownPrograms().size() != savedProgramCount) {
+                    saveKnownPrograms(detector.knownPrograms(), kKnownProgramsFile);
+                    savedProgramCount = detector.knownPrograms().size();
+                }
 
                 // Log a warning when a process CROSSES the threshold (not every second):
                 // same edge-detection idea as the system CPU alert, but per process.

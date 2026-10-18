@@ -112,16 +112,41 @@ std::vector<Change> ChangeDetector::checkProcesses(const std::vector<ProcessInfo
         if (p.name.empty()) {
             continue;
         }
-        // set::insert returns a pair; its .second is true only if the name was NEW.
-        const bool isNew = knownNames_.insert(p.name).second;
-        if (isNew && procPrimed_) {   // names seen during the baseline are not reported
+        if (knownNames_.count(p.name) > 0) {
+            continue;   // seen before: not news
+        }
+
+        // The list has a ceiling. Warn ONCE when it is reached, then stop tracking
+        // new names (otherwise a process could grow the list, and the saved file, forever).
+        if (knownNames_.size() >= kMaxKnownPrograms) {
+            if (procPrimed_ && !capWarned_) {
+                changes.push_back({LogLevel::Warning,
+                                   "Known-program list is full (" +
+                                       std::to_string(kMaxKnownPrograms) +
+                                       " names): new programs are no longer tracked",
+                                   0});
+                capWarned_ = true;
+            }
+            continue;
+        }
+
+        knownNames_.insert(p.name);
+        if (procPrimed_) {   // names seen during the baseline are remembered but not reported
             changes.push_back({LogLevel::Info,
-                               "New program started: " + p.name + " (pid " + std::to_string(p.pid) + ")",
+                               "First time seeing program: " + p.name +
+                                   " (pid " + std::to_string(p.pid) + ")",
                                0});
         }
     }
     procPrimed_ = true;
     return changes;
+}
+
+void ChangeDetector::loadKnownPrograms(const std::set<std::string>& names) {
+    knownNames_ = names;
+    // With a saved list, the very first sample is compared against it. With an
+    // empty list there's nothing to compare with, so the first sample is a baseline.
+    procPrimed_ = !knownNames_.empty();
 }
 
 void ChangeDetector::resetConnections() {
@@ -131,7 +156,6 @@ void ChangeDetector::resetConnections() {
 }
 
 void ChangeDetector::resetProcesses() {
-    knownNames_.clear();
     procPrimed_ = false;
 }
 

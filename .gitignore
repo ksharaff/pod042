@@ -74,3 +74,6 @@ profile.json
 
 build-asan/
 sanitizer.log
+
+known_programs.json
+known_programs.json.tmp
