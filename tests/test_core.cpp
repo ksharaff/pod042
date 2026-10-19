@@ -13,6 +13,7 @@
 #include <filesystem>
 #include <fstream>
 #include <string>
+#include <limits>
 
 #include "chips.h"
 #include "connections.h"
@@ -23,6 +24,8 @@
 #include "changes.h"
 #include "process.h"
 #include "knownprograms.h"
+#include "history.h"
+#include "host.h"
 
 // Helpers private to this file.
 namespace {
@@ -587,4 +590,163 @@ TEST(KnownPrograms, LoadSkipsNonStringsAndCleansNames) {
     EXPECT_EQ(loaded.size(), 2u);               // 42 and null were skipped
 
     std::filesystem::remove(path);
+}
+
+// ---------------------------------------------------------------------------
+// History and sparklines
+// ---------------------------------------------------------------------------
+
+TEST(History, KeepsOnlyTheNewestValues) {
+    History h(3);
+    for (int i = 1; i <= 5; ++i) {
+        h.push(i);
+    }
+    EXPECT_EQ(h.values(), (std::vector<double>{3.0, 4.0, 5.0}));   // 1 and 2 fell off
+
+    h.clear();
+    EXPECT_EQ(h.size(), 0u);
+}
+
+TEST(Sparkline, MapsValuesToBlocks) {
+    // 0 -> lowest block, 50 -> a middle block, 100 -> full block.
+    EXPECT_EQ(sparkline({0.0, 50.0, 100.0}, 3, 0.0, 100.0), "\u2581\u2585\u2588");
+}
+
+TEST(Sparkline, PadsOnTheLeftWhenThereAreFewerValuesThanWidth) {
+    EXPECT_EQ(sparkline({100.0}, 3, 0.0, 100.0), "  \u2588");   // newest value at the right edge
+    EXPECT_EQ(sparkline({}, 2, 0.0, 100.0), "  ");               // no data yet: only padding
+}
+
+TEST(Sparkline, ShowsOnlyTheLastWidthValues) {
+    EXPECT_EQ(sparkline({100.0, 0.0, 100.0}, 2, 0.0, 100.0), "\u2581\u2588");
+}
+
+TEST(Sparkline, ClampsOutOfRangeAndOddValues) {
+    EXPECT_EQ(sparkline({-5.0, 150.0}, 2, 0.0, 100.0), "\u2581\u2588");
+    // NaN (not-a-number) must not crash or draw garbage: it falls back to the lowest block.
+    const double nan = std::numeric_limits<double>::quiet_NaN();
+    EXPECT_EQ(sparkline({nan}, 1, 0.0, 100.0), "\u2581");
+}
+
+TEST(Sparkline, EmptyScaleDrawsTheLowestBlock) {
+    EXPECT_EQ(sparkline({5.0, 5.0}, 2, 5.0, 5.0), "\u2581\u2581");
+}
+
+TEST(Sparkline, AutoScaleUsesTheLargestValueShown) {
+    EXPECT_EQ(sparklineAuto({0.0, 10.0, 5.0}, 3), "\u2581\u2588\u2585");
+    EXPECT_EQ(sparklineAuto({0.0, 0.0}, 2), "\u2581\u2581");   // all zero: no division by zero
+    // The old spike (1000) has scrolled out of the 2-wide window, so it must not flatten the graph.
+    EXPECT_EQ(sparklineAuto({1000.0, 0.0, 10.0}, 2), "\u2581\u2588");
+}
+
+// ---------------------------------------------------------------------------
+// Load average, mounts
+// ---------------------------------------------------------------------------
+
+TEST(Host, ParseLoadAvg) {
+    LoadAvg load;
+    ASSERT_TRUE(parseLoadAvg("0.52 0.58 0.59 1/467 12345", load));
+    EXPECT_DOUBLE_EQ(load.one, 0.52);
+    EXPECT_DOUBLE_EQ(load.five, 0.58);
+    EXPECT_DOUBLE_EQ(load.fifteen, 0.59);
+}
+
+TEST(Host, ParseLoadAvgRejectsBadInput) {
+    LoadAvg load;
+    EXPECT_FALSE(parseLoadAvg("", load));
+    EXPECT_FALSE(parseLoadAvg("garbage here now", load));
+    EXPECT_FALSE(parseLoadAvg("0.5 0.5", load));        // too few numbers
+    EXPECT_FALSE(parseLoadAvg("-1.0 0.0 0.0", load));   // negative load can't exist
+}
+
+TEST(Host, UnescapeMountField) {
+    EXPECT_EQ(unescapeMountField(R"(my\040disk)"), "my disk");
+    EXPECT_EQ(unescapeMountField(R"(a\134b)"), "a\\b");   // \134 is a backslash
+    EXPECT_EQ(unescapeMountField("/plain/path"), "/plain/path");
+    // Things that are not complete, valid escapes are left alone.
+    EXPECT_EQ(unescapeMountField(R"(a\04)"), R"(a\04)");     // too short
+    EXPECT_EQ(unescapeMountField(R"(a\09b)"), R"(a\09b)");   // '9' is not an octal digit
+    EXPECT_EQ(unescapeMountField(R"(a\777)"), R"(a\777)");   // 511 is not a byte
+}
+
+TEST(Host, ParseMountLine) {
+    MountInfo m;
+    ASSERT_TRUE(parseMountLine("/dev/sdd / ext4 rw,relatime 0 0", m));
+    EXPECT_EQ(m.device, "/dev/sdd");
+    EXPECT_EQ(m.mountPoint, "/");
+    EXPECT_EQ(m.fsType, "ext4");
+
+    ASSERT_TRUE(parseMountLine(R"(/dev/sdb1 /mnt/my\040disk ext4 rw 0 0)", m));
+    EXPECT_EQ(m.mountPoint, "/mnt/my disk");
+
+    // A newline smuggled into a mount point must not reach the screen.
+    ASSERT_TRUE(parseMountLine(R"(/dev/sdc /mnt/a\012b ext4 rw 0 0)", m));
+    EXPECT_EQ(m.mountPoint, "/mnt/a?b");
+}
+
+TEST(Host, ParseMountLineRejectsShortLines) {
+    MountInfo m;
+    EXPECT_FALSE(parseMountLine("", m));
+    EXPECT_FALSE(parseMountLine("/dev/sdd /", m));
+}
+
+TEST(Host, WhichFilesystemsCount) {
+    EXPECT_TRUE(isRealFilesystem("ext4"));
+    EXPECT_TRUE(isRealFilesystem("xfs"));
+    EXPECT_TRUE(isRealFilesystem("9p"));        // WSL: the Windows drives
+    EXPECT_FALSE(isRealFilesystem("tmpfs"));
+    EXPECT_FALSE(isRealFilesystem("proc"));
+    EXPECT_FALSE(isRealFilesystem("squashfs"));
+    EXPECT_FALSE(isRealFilesystem("nfs"));      // skipped on purpose: statvfs can hang
+    EXPECT_FALSE(isRealFilesystem(""));
+}
+
+// ---------------------------------------------------------------------------
+// Per-core CPU
+// ---------------------------------------------------------------------------
+
+TEST(Cpu, ParseCpuLine) {
+    std::string label;
+    cpuInfo c;
+    ASSERT_TRUE(parseCpuLine("cpu0 10 1 5 85 3 0 0 0 0 0", label, c));   // 10 columns, as on modern kernels
+    EXPECT_EQ(label, "cpu0");
+    EXPECT_EQ(c.user, 10);
+    EXPECT_EQ(c.nice, 1);
+    EXPECT_EQ(c.system, 5);
+    EXPECT_EQ(c.idle, 85);
+    EXPECT_EQ(c.iowait, 3);
+
+    // The total line has two spaces after "cpu"; that must parse the same way.
+    ASSERT_TRUE(parseCpuLine("cpu  4705 150 1120 85030 320 0 45 0 0 0", label, c));
+    EXPECT_EQ(label, "cpu");
+    EXPECT_EQ(c.user, 4705);
+}
+
+TEST(Cpu, ParseCpuLineRejectsGarbageAndChangesNothing) {
+    std::string label = "untouched";
+    cpuInfo c;
+    c.user = 42;
+    EXPECT_FALSE(parseCpuLine("cpu abc", label, c));
+    EXPECT_FALSE(parseCpuLine("cpu0 1 2 3", label, c));   // too few columns
+    EXPECT_FALSE(parseCpuLine("", label, c));
+    EXPECT_EQ(label, "untouched");
+    EXPECT_EQ(c.user, 42);
+}
+
+TEST(Cpu, CoreUsagePerCore) {
+    std::vector<cpuInfo> before = {makeCpu(0, 0), makeCpu(0, 0)};
+    std::vector<cpuInfo> after  = {makeCpu(1000, 0), makeCpu(0, 1000)};   // core 0 busy, core 1 idle
+
+    std::vector<double> usage = coreUsage(before, after);
+    ASSERT_EQ(usage.size(), 2u);
+    EXPECT_NEAR(usage[0], 100.0, 0.001);
+    EXPECT_NEAR(usage[1], 0.0, 0.001);
+}
+
+TEST(Cpu, CoreUsageHandlesChangingCoreCounts) {
+    // A core was switched off between the two readings: only the common cores count.
+    std::vector<cpuInfo> before = {makeCpu(0, 0), makeCpu(0, 0), makeCpu(0, 0)};
+    std::vector<cpuInfo> after  = {makeCpu(1000, 0)};
+    EXPECT_EQ(coreUsage(before, after).size(), 1u);
+    EXPECT_TRUE(coreUsage({}, {}).empty());
 }

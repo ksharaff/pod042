@@ -44,16 +44,25 @@
 #include "pod.h"
 #include "changes.h"
 #include "knownprograms.h"
+#include "history.h"
+#include "host.h"
 
 using namespace ftxui;
 
 // warning color
 const Color kAmber = Color::RGB(255, 176, 0);
-
+const Color kTrack = Color::RGB(58, 58, 58);
 const double kWarnFraction = 0.8; // gauge turns into color at or above this number
 const std::size_t kMaxProcessRows = 12; // How many processes the screen shows (also limits what we copy around each second).
 
-const int kTabChips = 3; // loadout presets
+const int kTabChips = 4; // loadout presets
+
+const std::size_t kHistorySamples = 60;
+const std::size_t kSparkWidth = 16;
+
+// The details screen shows at most this many cores and mounts, so it fits the window.
+const std::size_t kMaxCoresShown = 16;
+const std::size_t kMaxMountsShown = 5;
 
 const int kHeartbeatSeconds = 60;
 const std::size_t kMaxChangesPerSample = 5;
@@ -64,6 +73,9 @@ const int kLinePauseMs = 200;
 
 const std::string kKnownProgramsFile = "known_programs.json";
 
+constexpr double GB = 1024.0 * 1024.0 * 1024.0;
+
+
 
 
 struct Telemetry {
@@ -71,8 +83,19 @@ struct Telemetry {
     DiskInfo disk;
     double cpuPercent = 0.0;
     NetRates net;
-    std::vector<ProcessInfo> processes; // top processes by CPU (empty unless the chip is installed)
-    std::size_t processCount = 0;
+    std::vector<ProcessInfo> processes;   // top processes by CPU (empty unless PROCESS WATCH is installed)
+    std::size_t processCount = 0;         // how many processes exist in total
+
+    LoadAvg load;                         // 1 / 5 / 15 minute load average
+    double uptimeSeconds = 0.0;
+    std::vector<double> corePercent;      // one value per CPU core
+    std::vector<MountInfo> mounts;        // only filled while DISK MONITOR is installed
+
+    // The last kHistorySamples seconds of each value, oldest first (for the sparklines).
+    std::vector<double> cpuHistory;
+    std::vector<double> memHistory;
+    std::vector<double> rxHistory;
+    std::vector<double> txHistory;
 };
 
 // formats 12.345 to 12.3%
@@ -82,10 +105,24 @@ std::string pct(double v) {
     return buf;
 }
 
+// "%.2f": a number with 2 digits after the point, e.g. "0.52".
+std::string fixed2(double v) {
+    char buf[32];
+    std::snprintf(buf, sizeof(buf), "%.2f", v);
+    return buf;
+}
+
 // format Bytes per second to KB/s
 std::string kbps(double bytesPerSec) {
     char buf[32];
     std::snprintf(buf, sizeof(buf), "%.1f KB/s", bytesPerSec / 1024.0);
+    return buf;
+}
+
+// Bytes -> gigabytes with one decimal, e.g. "54.2".
+std::string gbText(double bytes) {
+    char buf[32];
+    std::snprintf(buf, sizeof(buf), "%.1f", bytes / (1024.0 * 1024.0 * 1024.0));
     return buf;
 }
 
@@ -158,32 +195,48 @@ std::string formatProcessRow(const std::string& pid, const std::string& name,
 
 // One row: label, horizontal gauge, and value on the right
 // CPU [######      ] 42.0%
-Element meter(const std::string& label, double fraction, const std::string& value) {
+// A gauge with the dark track behind it. It turns amber at or above the warning
+// level, unless allowWarn is false (used for read-only mounts, which are expected to be full).
+Element gaugeBar(double fraction, bool allowWarn = true) {
     Element bar = gauge(static_cast<float>(fraction));
-
-    if(fraction >= kWarnFraction) {
-        bar = bar | color(kAmber);
+    if (allowWarn && fraction >= kWarnFraction) {
+        bar = bar | color(kAmber);   // decorators return a NEW element, so assign it back
     }
-    
-    return hbox({
-        text(label) | size(WIDTH, EQUAL, 6), // width exactly 6 characters
-        gauge(static_cast<float>(fraction)) | flex, // flex to fill leftover space
-        text(" " + value),
-    });
+    // bgcolor paints the whole gauge area, so the unfilled part shows as a dark track.
+    return bar | bgcolor(kTrack);
 }
 
-// Builds the SYSTEM STATUS screen from a snapshot
-Element statusPanel(const Telemetry& t, bool diskOn, bool netOn){
-    // constexpr = constant computed at compile time.
-    constexpr double GB = 1024.0 * 1024.0 * 1024.0;
+// Draws one row: label, gauge, optional sparkline, value.
+//   spark:      a sparkline string; left out when empty
+//   labelWidth: how many columns the label gets
+//   barWidth:   fixed width of the bar in columns; 0 = stretch to fill the row
+Element meter(const std::string& label, double fraction, const std::string& value,
+              const std::string& spark = "", int labelWidth = 6, int barWidth = 0) {
+    Element bar = gaugeBar(fraction);
 
+    Elements row;   // Elements = a std::vector<Element>
+    row.push_back(text(label) | size(WIDTH, EQUAL, labelWidth));
+    // A fixed width keeps the value right next to its bar.
+    row.push_back(barWidth > 0 ? bar | size(WIDTH, EQUAL, barWidth) : bar | flex);
+    if (!spark.empty()) {
+        row.push_back(text(" " + spark) | dim);
+    }
+    row.push_back(text(" " + value));
+    return hbox(std::move(row));
+}
+// Builds the SYSTEM STATUS screen from a snapshot.
+Element statusPanel(const Telemetry& t, bool diskOn, bool netOn) {
+    // Memory is a core system: always shown.
     double memUsedKb = static_cast<double>(t.mem.totalKb - t.mem.availableKb);
     double memFrac = t.mem.totalKb > 0 ? memUsedKb / static_cast<double>(t.mem.totalKb) : 0.0;
 
+    // The disk row depends on the DISK MONITOR chip.
     Element diskRow;
     if (diskOn) {
         double diskUsed = static_cast<double>(t.disk.totalBytes - t.disk.availableBytes);
         double diskFrac = t.disk.totalBytes > 0 ? diskUsed / static_cast<double>(t.disk.totalBytes) : 0.0;
+        // Right after installing the chip, the first reading hasn't arrived yet
+        // (total is still 0), so show a placeholder instead of "0 / 0 GB".
         std::string diskText = t.disk.totalBytes > 0
             ? std::to_string(static_cast<long>(diskUsed / GB)) + " / " +
               std::to_string(static_cast<long>(static_cast<double>(t.disk.totalBytes) / GB)) + " GB"
@@ -193,11 +246,27 @@ Element statusPanel(const Telemetry& t, bool diskOn, bool netOn){
         diskRow = text("DISK    [" + kChipDisk + " NOT INSTALLED]") | dim;
     }
 
+    // The network section depends on the NETWORK SCAN chip.
     Elements netRows;
     if (netOn) {
         netRows.push_back(text("NETWORK"));
-        netRows.push_back(text("  DOWNLOAD:  " + kbps(t.net.rxBytesPerSec)));
-        netRows.push_back(text("  UPLOAD:    " + kbps(t.net.txBytesPerSec)));
+        separator();
+        
+        netRows.push_back(hbox({
+            text("  DOWNLOAD  " + kbps(t.net.rxBytesPerSec)) | size(WIDTH, EQUAL, 24),
+            text(sparklineAuto(t.txHistory, kSparkWidth)) | dim,
+        }));
+        
+        netRows.push_back(hbox({
+            text("")
+        }));
+            
+        netRows.push_back(hbox({
+            text("  UPLOAD    " + kbps(t.net.txBytesPerSec)) | size(WIDTH, EQUAL, 24),
+            text(sparklineAuto(t.txHistory, kSparkWidth)) | dim,
+        }));
+            
+        
     } else {
         netRows.push_back(text("NETWORK [" + kChipNetwork + " NOT INSTALLED]") | dim);
     }
@@ -205,16 +274,132 @@ Element statusPanel(const Telemetry& t, bool diskOn, bool netOn){
     return vbox({
         text("SYSTEM STATUS") | bold,
         separator(),
-        meter("CPU", t.cpuPercent / 100.0, pct(t.cpuPercent)),
-        separatorEmpty(),
+        // CPU and memory are percentages, so their sparklines use a fixed 0-100 scale.
+        meter("CPU", t.cpuPercent / 100.0, pct(t.cpuPercent),
+              sparkline(t.cpuHistory, kSparkWidth, 0.0, 100.0)),
+        separatorLight(),
         meter("MEM", memFrac,
               std::to_string(static_cast<long>(memUsedKb / 1024.0)) + " / " +
-              std::to_string(t.mem.totalKb / 1024) + " MB"),
-        separatorEmpty(),
-
+              std::to_string(t.mem.totalKb / 1024) + " MB",
+              sparkline(t.memHistory, kSparkWidth, 0.0, 100.0)),
+        separatorLight(),
         diskRow,
         separator(),
         vbox(std::move(netRows)),
+    });
+}
+
+// One mounted filesystem:  [bar]  used / total GB  /mount/point
+// The path comes LAST, so a long path is never cut in the middle, and the bar
+// starts at the same column as the bars above it.
+Element mountRow(const MountInfo& m) {
+    const double total = static_cast<double>(m.disk.totalBytes);
+    const double avail = static_cast<double>(m.disk.availableBytes);
+    const double used = total > avail ? total - avail : 0.0;
+    const double fraction = total > 0.0 ? used / total : 0.0;
+
+    std::string value = gbText(used) + " / " + gbText(total) + " GB";
+    if (m.readOnly) {
+        value += "  RO";
+    }
+
+    Element row = hbox({
+        text("") | size(WIDTH, EQUAL, 6),   // an empty label column keeps the bars aligned
+        // A full read-only mount is normal (kernel headers, squashfs, ...), so no amber for it.
+        gaugeBar(fraction, !m.readOnly) | size(WIDTH, EQUAL, 20),
+        text(" " + value + "  " + m.mountPoint),
+    });
+
+    // Read-only mounts are shown, but quietly.
+    return m.readOnly ? row | dim : row;
+}
+
+// Builds the SYSTEM DETAILS screen: uptime, load, swap, per-core CPU, mounts.
+Element detailsPanel(const Telemetry& t, bool diskOn) {
+    constexpr double GB = 1024.0 * 1024.0 * 1024.0;
+    const std::size_t cores = t.corePercent.size();
+
+    // Load average means "how many processes wanted a CPU, on average". Compare it with
+    // the number of cores: a load of 4.0 on a 4-core machine means every core was busy;
+    // above that, work is waiting in line, so the line turns amber.
+    Element loadLine = text("LOAD AVG   " + fixed2(t.load.one) + "  " + fixed2(t.load.five) +
+                            "  " + fixed2(t.load.fifteen) + "   (1 / 5 / 15 MIN)");
+    if (cores > 0 && t.load.one > static_cast<double>(cores)) {
+        loadLine = loadLine | color(kAmber);
+    }
+
+    // Swap is disk space used as overflow memory. A busy swap means RAM ran short.
+    Element swapRow;
+    if (t.mem.swapTotalKb > 0) {
+        double swapUsedKb = static_cast<double>(t.mem.swapTotalKb - t.mem.swapFreeKb);
+            swapRow = meter("SWAP", swapUsedKb / static_cast<double>(t.mem.swapTotalKb),
+                        std::to_string(static_cast<long>(swapUsedKb / 1024.0)) + " / " +
+                        std::to_string(t.mem.swapTotalKb / 1024) + " MB",
+                        "", 6, 20);
+    } else {
+        swapRow = text("SWAP    NONE CONFIGURED") | dim;
+    }
+
+    // Per-core bars. With more than 8 cores they go into two columns to save height.
+    Element coreBlock;
+    if (cores == 0) {
+        coreBlock = text("NO PER-CORE DATA") | dim;
+    } else {
+        const std::size_t shownCores = std::min(cores, kMaxCoresShown);
+        const std::size_t columns = shownCores > 8 ? 2 : 1;
+        const std::size_t perColumn = (shownCores + columns - 1) / columns;   // divides, rounding up
+
+        Elements columnBoxes;
+        for (std::size_t col = 0; col < columns; ++col) {
+            Elements rows;
+            for (std::size_t i = col * perColumn; i < shownCores && i < (col + 1) * perColumn; ++i) {
+                rows.push_back(meter("C" + std::to_string(i), t.corePercent[i] / 100.0,
+                                     pct(t.corePercent[i]), "", 6, 20));
+                if (i + 1 < shownCores && i + 1 < (col + 1) * perColumn) {
+                    rows.push_back(separatorLight());
+                }
+            }
+            columnBoxes.push_back(vbox(std::move(rows)) | flex);
+            if (col + 1 < columns) {
+                columnBoxes.push_back(text("  "));   // a gap between the two columns
+            }
+        }
+
+        Elements coreRows;
+        coreRows.push_back(hbox(std::move(columnBoxes)));
+        if (cores > shownCores) {
+            coreRows.push_back(text("... +" + std::to_string(cores - shownCores) + " MORE CORES") | dim);
+        }
+        coreBlock = vbox(std::move(coreRows));
+    }
+
+    // Mounted filesystems need the DISK MONITOR chip.
+    Elements mountRows;
+    if (!diskOn) {
+        mountRows.push_back(text("[" + kChipDisk + " NOT INSTALLED]") | dim);
+    } else if (t.mounts.empty()) {
+        mountRows.push_back(text("READING...") | dim);   // the first reading arrives within a second
+    } else {
+        std::size_t shown = 0;
+        for (const MountInfo& m : t.mounts) {
+            if (shown >= kMaxMountsShown) break;
+            mountRows.push_back(mountRow(m));
+            ++shown;
+        }
+    }
+
+    return vbox({
+        text("SYSTEM DETAILS") | bold,
+        separator(),
+        text("UPTIME     " + formatDuration(t.uptimeSeconds) + "  (H:M:S)"),
+        loadLine,
+        swapRow,
+        separator(),
+        text("CPU CORES (" + std::to_string(cores) + ")") | dim,
+        coreBlock,
+        separator(),
+        text("MOUNTED FILESYSTEMS") | dim,
+        vbox(std::move(mountRows)),
     });
 }
 
@@ -398,6 +583,20 @@ int main(int argc, char** argv) {
         const auto startTime = std::chrono::steady_clock::now();
         auto lastHeartbeat = startTime;
 
+        History cpuHist(kHistorySamples);
+        History memHist(kHistorySamples);
+        History rxHist(kHistorySamples);
+        History txHist(kHistorySamples);
+
+        // Per-core CPU needs a previous reading, just like the total.
+        std::vector<cpuInfo> prevCores = readCoreCpuInfo();
+
+        // Mounted filesystems change rarely and cost one statvfs() call each, so they are
+        // read every 5th second (and immediately when the chip is installed).
+        std::vector<MountInfo> mounts;
+        bool mountsWereOn = false;
+        int mountTick = 0;
+
         ChangeDetector detector;   // remembers the previous sample for the event feed
 
         detector.loadKnownPrograms(loadKnownPrograms(kKnownProgramsFile));
@@ -433,6 +632,8 @@ int main(int argc, char** argv) {
             }
         };
 
+        
+
         while(running) {
             // sleep 1 second
             for(int i = 0; i < 10 && running; ++i) {
@@ -441,12 +642,37 @@ int main(int argc, char** argv) {
             if(!running) break;
 
             cpuInfo nowCpu = readCpuInfo();
+            std::vector<cpuInfo> nowCores = readCoreCpuInfo();
             auto nowTime = std::chrono::steady_clock::now();
             double seconds = std::chrono::duration<double>(nowTime - prevTime).count();
 
             Telemetry t;
             t.mem  = readMemInfo();
             t.cpuPercent = cpuUsagePercent(prevCpu, nowCpu);
+            t.load = readLoadAvg();
+            t.uptimeSeconds = readUptimeSeconds();
+            t.corePercent = coreUsage(prevCores, nowCores);
+
+            const double memPercent = t.mem.totalKb > 0
+                ? 100.0 * static_cast<double>(t.mem.totalKb - t.mem.availableKb) /
+                      static_cast<double>(t.mem.totalKb)
+                : 0.0;
+            cpuHist.push(t.cpuPercent);
+            memHist.push(memPercent);
+
+            // Mounted filesystems (DISK MONITOR chip).
+            if (diskEnabled) {
+                if (!mountsWereOn || mountTick % 5 == 0) {
+                    mounts = readMounts();
+                }
+                ++mountTick;
+                mountsWereOn = true;
+                t.mounts = mounts;
+            } else {
+                mounts.clear();
+                mountsWereOn = false;
+                mountTick = 0;   // reinstalling the chip reads right away
+            }
 
             if(diskEnabled) {
                 t.disk = readDiskInfo("/");
@@ -457,6 +683,8 @@ int main(int argc, char** argv) {
                 NetInfo nowNet = readNetInfo();
                 if (netPrimed) {
                     t.net = netRates(prevNet, nowNet, seconds);
+                    rxHist.push(t.net.rxBytesPerSec);   // NEW
+                    txHist.push(t.net.txBytesPerSec);   // NEW
                 }
                 prevNet = nowNet;
                 netPrimed = true;
@@ -466,6 +694,8 @@ int main(int argc, char** argv) {
             } else {
                 netPrimed = false;               // forget the old reading
                 detector.resetConnections();     // and the old connection list
+                rxHist.clear();                  // NEW: an old graph would be misleading
+                txHist.clear();
             }
 
             // PROCESS WATCH: sample all processes, but only while the chip is installed.
@@ -515,14 +745,16 @@ int main(int argc, char** argv) {
 
             // Pod heartbeat: once every kHeartbeatSeconds, one line in the log.
             if (nowTime - lastHeartbeat >= std::chrono::seconds(kHeartbeatSeconds)) {
-                double memPercent = t.mem.totalKb > 0
-                    ? 100.0 * static_cast<double>(t.mem.totalKb - t.mem.availableKb) /
-                          static_cast<double>(t.mem.totalKb)
-                    : 0.0;
                 double uptime = std::chrono::duration<double>(nowTime - startTime).count();
                 logEvent(LogLevel::Info, podHeartbeat(t.cpuPercent, memPercent, uptime));
                 lastHeartbeat = nowTime;
             }
+
+            // Copy the histories into the snapshot the UI will read.
+            t.cpuHistory = cpuHist.values();
+            t.memHistory = memHist.values();
+            t.rxHistory = rxHist.values();
+            t.txHistory = txHist.values();
 
             {
                 std::lock_guard<std::mutex> lock(telemtryMutex);
@@ -531,6 +763,7 @@ int main(int argc, char** argv) {
 
             prevCpu = nowCpu;
             prevTime  = nowTime;
+            prevCores = nowCores;
 
             screen.PostEvent(Event::Custom);
         }
@@ -637,16 +870,21 @@ int main(int argc, char** argv) {
 
     // Left menu: list of screens. "tab" holds the selected index
     // menu stores the address of "tab" and updates it as you move
-    std::vector<std::string> tabNames = {"SYSTEM STATUS", "NETWORK CONNECTIONS",
-                                         "PROCESS WATCH", "CHIP CONFIGURATION",
-                                         "SYSTEM LOGS"};
+    std::vector<std::string> tabNames = {"SYSTEM STATUS", "SYSTEM DETAILS",
+                                         "NETWORK CONNECTIONS", "PROCESS WATCH",
+                                         "CHIP CONFIGURATION", "SYSTEM LOGS"};
     int tab = 0;
     Component tabMenu = Menu(&tabNames, &tab, MenuOption::Vertical());
 
-    // Screen 1: status
+    // Screen: status
     // This lambda runs every time the screen is redrawn
     Component statusView = Renderer([&] {
         return statusPanel(snapshotTelemetry(), diskEnabled, netEnabled);
+    });
+
+    // Screen: system details (uptime, load, swap, per-core CPU, mounts).
+    Component detailsView = Renderer([&] {
+        return detailsPanel(snapshotTelemetry(), diskEnabled);
     });
 
     // Screen: network connections. Only works if the NETWORK SCAN chip is installed.
@@ -774,14 +1012,6 @@ int main(int argc, char** argv) {
         double total = chips.totalSlots();
         const Chip& selected = chips.chips()[static_cast<std::size_t>(chipSelected)];
 
-        // Build "PRESETS:  [1] DIAGNOSTIC  [2] EXPLORATION  [3] SECURITY" from the
-        // preset list, so adding a preset in loadout.cpp updates the screen too.
-        std::string presetLine = "PRESETS:";
-        const std::vector<Preset>& all = presets();
-        for (std::size_t i = 0; i < all.size(); ++i) {
-            presetLine += "  [" + std::to_string(i + 1) + "] " + all[i].name;
-        }
-
         return vbox({
             text("CHIP CONFIGURATION") | bold,
             separator(),
@@ -793,7 +1023,12 @@ int main(int argc, char** argv) {
             text(selected.description) | dim,
             text(chipMessage) | bold | color(kAmber),
             separator(),
-            text(presetLine),
+            text("PRESETS:"),
+            text("[1] DIAGNOSTIC"),
+            text("[2] EXPLORATION"),
+            text("[3] Security"),
+            
+            separatorEmpty(),
             text("RIGHT: focus list   ENTER: install / remove   1-3: load preset") | dim,
         });
     });
@@ -817,7 +1052,7 @@ int main(int argc, char** argv) {
     // Container::Tab holds several components but shows only the one at index
     // "tab" (the left menu's selection).
     Component tabs = Container::Tab(
-        {statusView, connectionsView, processesView, chipsView, logsView}, &tab);
+        {statusView, detailsView, connectionsView, processesView, chipsView, logsView}, &tab);
 
     // Container::Horizontal groups the left menu and the right panel, so
     // Left/Right arrow keys move focus between them.

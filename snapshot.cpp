@@ -1,4 +1,3 @@
-#include "snapshot.h"
 #include <chrono>
 #include <ctime>
 #include <iomanip>   // std::put_time
@@ -12,6 +11,8 @@
 #include "meminfo.h"
 #include "net.h"
 #include "process.h"
+#include "host.h"
+#include "snapshot.h"
 
 using json = nlohmann::json;
 
@@ -22,6 +23,8 @@ std::string takeSnapshotJson(const ChipManager& chips) {
 
     // ---- First samples ----
     cpuInfo cpuBefore = readCpuInfo();
+    std::vector<cpuInfo> coresBefore = readCoreCpuInfo();
+
     NetInfo netBefore = readNetInfo();
     ProcessSampler sampler;
     if (procOn) {
@@ -33,6 +36,7 @@ std::string takeSnapshotJson(const ChipManager& chips) {
 
     // ---- Second samples ----
     cpuInfo cpuAfter = readCpuInfo();
+    std::vector<cpuInfo> coresAfter = readCoreCpuInfo();
     NetInfo netAfter = readNetInfo();
     const double seconds =
         std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
@@ -50,8 +54,17 @@ std::string takeSnapshotJson(const ChipManager& chips) {
     // Core systems: always included.
     j["cpu_percent"] = cpuUsagePercent(cpuBefore, cpuAfter);
     MemInfo mem = readMemInfo();
-    // A braced list of {"key", value} pairs becomes a JSON object.
-    j["memory"] = {{"total_kb", mem.totalKb}, {"available_kb", mem.availableKb}};
+
+    j["memory"] = {{"total_kb", mem.totalKb},
+                   {"available_kb", mem.availableKb},
+                   {"swap_total_kb", mem.swapTotalKb},
+                   {"swap_free_kb", mem.swapFreeKb}};
+
+    // Always-on host readings.
+    j["uptime_seconds"] = readUptimeSeconds();
+    LoadAvg load = readLoadAvg();
+    j["load_average"] = {{"1m", load.one}, {"5m", load.five}, {"15m", load.fifteen}};
+    j["cpu_cores_percent"] = coreUsage(coresBefore, coresAfter);   // a vector<double> becomes a JSON array
 
     json enabled = json::array();
     for (const Chip& c : chips.chips()) {
@@ -67,6 +80,16 @@ std::string takeSnapshotJson(const ChipManager& chips) {
     if (diskOn) {
         DiskInfo d = readDiskInfo("/");
         j["disk"] = {{"total_bytes", d.totalBytes}, {"available_bytes", d.availableBytes}};
+        json mounts = json::array();
+        for (const MountInfo& m : readMounts()) {
+            mounts.push_back({{"mount_point", m.mountPoint},
+                              {"device", m.device},
+                              {"fs_type", m.fsType},
+                              {"total_bytes", m.disk.totalBytes},
+                              {"available_bytes", m.disk.availableBytes},
+                              {"read_only", m.readOnly}});
+        }
+        j["mounts"] = mounts;
     }
 
     if (netOn) {

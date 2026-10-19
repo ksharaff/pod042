@@ -1,22 +1,23 @@
-#include "meminfo.h"   // quotes = your own header, <> = system/library header
+#include "meminfo.h"
 #include <fstream>
 #include <sstream>
 #include <string>
 
-using namespace std;
-
-// Definition: the real implementation lives here.
 MemInfo readMemInfo() {
     MemInfo info;
-    ifstream file("/proc/meminfo");
-    string line;
-    while (getline(file, line)) {
-        istringstream iss(line);
-        string key;
-        long value;
-        iss >> key >> value;
+    std::ifstream file("/proc/meminfo");
+    std::string line;
+
+    while (std::getline(file, line)) {
+        std::istringstream iss(line);
+        std::string key;
+        long value = 0;
+        iss >> key >> value;   // e.g. "MemTotal:" then 16384000 (the "kB" is ignored)
+
         if (key == "MemTotal:")     info.totalKb = value;
         if (key == "MemAvailable:") info.availableKb = value;
+        if (key == "SwapTotal:")    info.swapTotalKb = value;
+        if (key == "SwapFree:")     info.swapFreeKb = value;
     }
     return info;
 }
