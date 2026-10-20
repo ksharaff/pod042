@@ -4,10 +4,8 @@ A NieR:Automata-inspired system diagnostics tool for the Linux terminal, written
 
 You boot it like an android's internal operating system. Behind the theme it is a real, live monitor: it reads CPU, memory, disk, network, processes and connections straight from `/proc` and the kernel, and reports what changes.
 
-> 📷 **SCREENSHOT PLACEHOLDER (hero image)**
-> File: `docs/screenshots/status.png`
-> Show: the SYSTEM STATUS screen with the header, the CPU / MEM / DISK gauges with their sparklines, and the network section. Generate a little load first (`yes > /dev/null &`, stop it with `killall yes`) so the bars and sparklines are not flat.
-> Then replace this block with: `![POD-042 system status](docs/screenshots/status.png)`
+<img width="1890" height="902" alt="image" src="https://github.com/user-attachments/assets/de31dabe-509b-484d-8e69-cc3b9f139bff" />
+
 
 ## What it does
 
