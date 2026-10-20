@@ -21,7 +21,6 @@ You boot it like an android's internal operating system. Behind the theme it is 
 ## Screenshots
 
 # Boot Sequence
----
 <img width="1920" height="1080" alt="boot" src="https://github.com/user-attachments/assets/00c15d82-bc52-401a-b462-ed54e49201f1" />
 
 # System Details
