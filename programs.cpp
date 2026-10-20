@@ -1,4 +1,4 @@
-#include "knownprograms.h"
+#include "programs.h"
 #include <filesystem>
 #include <fstream>
 #include <nlohmann/json.hpp>

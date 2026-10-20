@@ -7,6 +7,7 @@ ChipManager::ChipManager(int totalSlots) : totalSlots_(totalSlots) {
         {"PROCESS WATCH", "Enables the process scanner", 2},
         {"LOG STREAM", "Enables the live log tail", 1},
         {"DISK MONITOR",  "Enables disk usage readings", 1},
+        {"COMMS", "Enables the Pod-to-Pod message link", 1},
     };
 }
 

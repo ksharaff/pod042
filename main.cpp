@@ -1,62 +1,82 @@
-// MOST COMMENTS ARE WRITTEN BY THE AUTHOR HIMSELF
-// THE GOAT
-// KHALED SHARAFEDDIN
+// ============================================================================
+// main.cpp - POD-042 terminal interface
+//
+//   1. A background thread ("refresher") reads system stats every second,
+//      runs the event feed, and starts/stops the COMMS link.
+//   2. A second background thread types out the boot sequence.
+//   3. The COMMS node has its own I/O thread (see comms.cpp).
+//   4. The UI (FTXUI) draws everything and reacts to keys.
+// ============================================================================
 
-// some are written by the second goat, CLAUDE
-
-// ---- Standard library headers ----
-#include <atomic>    // std::atomic: a variable that is safe to share between threads
-#include <chrono>    // time utilities (durations, clocks)
-#include <cstdio>    // std::snprintf: formats numbers into text
-#include <fstream>   // std::ifstream: reads files (used to show the log)
-#include <mutex>     // std::mutex: a lock that stops two threads touching data at once
-#include <string>
-#include <thread>    // std::thread: runs a function in the background
-#include <vector>
-#include <iostream>
-#include <cctype>   // std::toupper: converts a letter to uppercase
+#include <algorithm>    // std::min, std::any_of
+#include <atomic>       // std::atomic: a variable that is safe to share between threads
+#include <cctype>       // std::toupper
+#include <chrono>       // time utilities
+#include <cstdio>       // std::snprintf: formats numbers into text
+#include <filesystem>   // std::filesystem: delete/check files
+#include <fstream>      // std::ifstream / std::ofstream
+#include <iostream>     // std::cin / std::cout: plain terminal input and output
 #include <map>
+#include <mutex>        // std::mutex: a lock so two threads don't touch data at once
 #include <set>
-#include <algorithm>
-#include <filesystem>
+#include <string>
+#include <thread>       // std::thread: runs a function in the background
+#include <vector>
 
-
-
-// FTXUI headers
-// component.hpp:          interactive pieces (menus, containers, key handling)
-// screen_interactive.hpp: the fullscreen app that runs the event loop
-// elements.hpp:           things you draw (text, gauge, borders, vbox, hbox, ...)
 #include <ftxui/component/component.hpp>
 #include <ftxui/component/screen_interactive.hpp>
 #include <ftxui/dom/elements.hpp>
 
+#include "changes.h"
 #include "chips.h"
+#include "comms.h"
+#include "config.h"
+#include "connections.h"
 #include "cpu.h"
 #include "disk.h"
+#include "history.h"
+#include "host.h"
+#include "programs.h"
 #include "loadout.h"
 #include "log.h"
 #include "meminfo.h"
 #include "net.h"
-#include "profile.h"
-#include "connections.h"
-#include "process.h"
-#include "snapshot.h"
 #include "pod.h"
-#include "changes.h"
-#include "knownprograms.h"
-#include "history.h"
-#include "host.h"
+#include "process.h"
+#include "profile.h"
+#include "protocol.h"
+#include "snapshot.h"
 
 using namespace ftxui;
 
-// warning color
+// ----------------------------------------------------------------------------
+// Constants
+// ----------------------------------------------------------------------------
+
+// One named color used for every warning, so the look stays consistent.
 const Color kAmber = Color::RGB(255, 176, 0);
+
+// The dark strip drawn behind every gauge, so the empty part of a bar is visible too.
 const Color kTrack = Color::RGB(58, 58, 58);
-const double kWarnFraction = 0.8; // gauge turns into color at or above this number
-const std::size_t kMaxProcessRows = 12; // How many processes the screen shows (also limits what we copy around each second).
 
-const int kTabChips = 4; // loadout presets
+// The gauge warning level (0.8 = 80%). It starts at the default and is set ONCE from
+// config.json at the start of main(), before any thread is created, so every thread
+// afterwards only reads it. That is why a plain (non-atomic) variable is safe here.
+double gWarnFraction = 0.8;
 
+// Files, in the folder you launch from (like the log and the loadout).
+const std::string kConfigFile = "config.json";
+const std::string kKnownProgramsFile = "known_programs.json";
+
+// The most changes written to the log per sample; the rest become "... and N more".
+const std::size_t kMaxChangesPerSample = 5;
+
+// Typewriter timing for the boot sequence. Raise them to type slower.
+const int kCharDelayMs = 18;    // pause after each character
+const int kLinePauseMs = 200;   // extra pause after each finished line
+
+// How many seconds of history we keep for the sparklines, and how many of them
+// each sparkline shows.
 const std::size_t kHistorySamples = 60;
 const std::size_t kSparkWidth = 16;
 
@@ -64,20 +84,18 @@ const std::size_t kSparkWidth = 16;
 const std::size_t kMaxCoresShown = 16;
 const std::size_t kMaxMountsShown = 5;
 
-const int kHeartbeatSeconds = 60;
-const std::size_t kMaxChangesPerSample = 5;
+// How many processes the process screen shows.
+const std::size_t kMaxProcessRows = 12;
 
-// Typewriter timing for the boot sequence. Raise them to type slower.
-const int kCharDelayMs = 30;
-const int kLinePauseMs = 200;   
+// Index of a screen in tabNames (used for the hotkeys). The screens are:
+// STATUS 0, DETAILS 1, CONNECTIONS 2, PROCESS WATCH 3, CHIPS 4, COMMS 5, LOGS 6.
+const int kTabChips = 4;
+const int kTabComms = 5;
 
-const std::string kKnownProgramsFile = "known_programs.json";
-
-constexpr double GB = 1024.0 * 1024.0 * 1024.0;
-
-
-
-
+// ----------------------------------------------------------------------------
+// Telemetry: one snapshot of all the numbers the screens show.
+// The refresher thread builds a new one every second; the UI reads it.
+// ----------------------------------------------------------------------------
 struct Telemetry {
     MemInfo mem;
     DiskInfo disk;
@@ -98,10 +116,21 @@ struct Telemetry {
     std::vector<double> txHistory;
 };
 
-// formats 12.345 to 12.3%
+// ----------------------------------------------------------------------------
+// Small formatting helpers
+// ----------------------------------------------------------------------------
+
+// 12.345 -> "12.3%".  "%.1f" = one digit after the point, "%%" = a literal percent sign.
 std::string pct(double v) {
     char buf[32];
     std::snprintf(buf, sizeof(buf), "%.1f%%", v);
+    return buf;
+}
+
+// Bytes per second -> "12.3 KB/s".
+std::string kbps(double bytesPerSec) {
+    char buf[32];
+    std::snprintf(buf, sizeof(buf), "%.1f KB/s", bytesPerSec / 1024.0);
     return buf;
 }
 
@@ -112,13 +141,6 @@ std::string fixed2(double v) {
     return buf;
 }
 
-// format Bytes per second to KB/s
-std::string kbps(double bytesPerSec) {
-    char buf[32];
-    std::snprintf(buf, sizeof(buf), "%.1f KB/s", bytesPerSec / 1024.0);
-    return buf;
-}
-
 // Bytes -> gigabytes with one decimal, e.g. "54.2".
 std::string gbText(double bytes) {
     char buf[32];
@@ -126,18 +148,29 @@ std::string gbText(double bytes) {
     return buf;
 }
 
-// Removes spaces, tabs and newlines from both ends of a string.
-std::string trim(const std::string& s) {
-    const char* whitespace = " \t\r\n";
-    std::size_t start = s.find_first_not_of(whitespace); //npos = "not found"
-    if (start == std::string::npos) {
-        return "";
-    }
-    std::size_t end = s.find_last_not_of(whitespace);
-    return s.substr(start, end - start + 1);   // substr(startPosition, length)
+// Formats a number without trailing zeros: 80 -> "80", 55.5 -> "55.5". "%g" picks the shortest form.
+std::string numText(double v) {
+    char buf[32];
+    std::snprintf(buf, sizeof(buf), "%g", v);
+    return buf;
 }
 
+// Returns an uppercase copy. "s" is taken BY VALUE, so it is our own copy to change.
+std::string toUpper(std::string s) {
+    for (char& c : s) {   // "char&" = a reference, so assigning to c edits the string
+        c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+    }
+    return s;
+}
 
+// A wildcard bind listens on every local interface for either address family.
+bool isWildcardAddress(const std::string& address) {
+    return address == "0.0.0.0" || address == "::";
+}
+
+// Returns the position just after the UTF-8 character that STARTS at "pos".
+// Non-English characters take 2-4 bytes, and cutting one in half prints garbage.
+// Continuation bytes always look like 10xxxxxx, which (byte & 0xC0) == 0x80 detects.
 std::size_t nextCharEnd(const std::string& s, std::size_t pos) {
     ++pos;   // always step over the first byte
     while (pos < s.size() && (static_cast<unsigned char>(s[pos]) & 0xC0) == 0x80) {
@@ -146,18 +179,9 @@ std::size_t nextCharEnd(const std::string& s, std::size_t pos) {
     return pos;
 }
 
-
-std::string toUpper(std::string s) {
-    for (char& c : s) {
-        c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
-    }
-    return s;
-}
-
-// Formats one table row with fixed-width columns.
-// "%-12s" means: print a string, left-aligned, padded with spaces to 12 characters.
-// The terminal uses a monospaced font, so padded text lines up as a table.
-// .c_str() gives the C-style text that snprintf's %s expects.
+// One row of the connections table, with fixed-width columns.
+// "%-12s" = text, left-aligned, padded with spaces to 12 characters. The terminal font is
+// monospaced, so padded text lines up as a table. .c_str() gives the C-style text %s expects.
 std::string formatRow(const std::string& state, const std::string& local,
                       const std::string& remote, const std::string& owner) {
     char buf[200];
@@ -166,8 +190,7 @@ std::string formatRow(const std::string& state, const std::string& local,
     return buf;
 }
 
-// One row of the process table, with fixed-width columns.
-// "%-8s" = text, left-aligned, 8 wide. "%8s" = right-aligned, so numbers line up.
+// One row of the process table. "%8s" = right-aligned, so numbers line up.
 std::string formatProcessRow(const std::string& pid, const std::string& name,
                              const std::string& cpu, const std::string& mem) {
     char buf[128];
@@ -175,31 +198,21 @@ std::string formatProcessRow(const std::string& pid, const std::string& name,
                   pid.c_str(), name.c_str(), cpu.c_str(), mem.c_str());
     return buf;
 }
+
 // ----------------------------------------------------------------------------
-// meter(): draws one row like   CPU   [#######     ]  42.0%
+// Gauges
 //
-// In FTXUI, everything you draw is an "Element". You build bigger Elements out
-// of smaller ones:
-//   text("hi")          a line of text
-//   gauge(0.5f)         a horizontal progress bar (0.0 = empty, 1.0 = full)
-//   hbox({a, b, c})     puts elements side by side (horizontal box)
-//   vbox({a, b, c})     stacks elements top to bottom (vertical box)
-//
-// The "|" operator applies a "decorator" that changes how an element looks or
-// is sized, for example:
-//   | bold                       makes text bold
-//   | border                     draws a box around it
-//   | size(WIDTH, EQUAL, 6)      forces the width to exactly 6 characters
-//   | flex                       lets it stretch to fill leftover space
+// In FTXUI everything you draw is an "Element". You build bigger ones from smaller ones:
+//   text("hi")        a line of text          gauge(0.5f)    a progress bar (0.0 - 1.0)
+//   hbox({a, b})      side by side            vbox({a, b})   stacked
+// The "|" operator applies a "decorator" (bold, border, size, flex, color, ...).
 // ----------------------------------------------------------------------------
 
-// One row: label, horizontal gauge, and value on the right
-// CPU [######      ] 42.0%
-// A gauge with the dark track behind it. It turns amber at or above the warning
-// level, unless allowWarn is false (used for read-only mounts, which are expected to be full).
+// A gauge with the dark track behind it. It turns amber at or above the warning level,
+// unless allowWarn is false (used for read-only mounts, which are expected to be full).
 Element gaugeBar(double fraction, bool allowWarn = true) {
     Element bar = gauge(static_cast<float>(fraction));
-    if (allowWarn && fraction >= kWarnFraction) {
+    if (allowWarn && fraction >= gWarnFraction) {
         bar = bar | color(kAmber);   // decorators return a NEW element, so assign it back
     }
     // bgcolor paints the whole gauge area, so the unfilled part shows as a dark track.
@@ -210,6 +223,7 @@ Element gaugeBar(double fraction, bool allowWarn = true) {
 //   spark:      a sparkline string; left out when empty
 //   labelWidth: how many columns the label gets
 //   barWidth:   fixed width of the bar in columns; 0 = stretch to fill the row
+// A parameter written "= value" is a DEFAULT ARGUMENT: callers may leave it out.
 Element meter(const std::string& label, double fraction, const std::string& value,
               const std::string& spark = "", int labelWidth = 6, int barWidth = 0) {
     Element bar = gaugeBar(fraction);
@@ -224,8 +238,15 @@ Element meter(const std::string& label, double fraction, const std::string& valu
     row.push_back(text(" " + value));
     return hbox(std::move(row));
 }
-// Builds the SYSTEM STATUS screen from a snapshot.
+
+// ----------------------------------------------------------------------------
+// Screens that are plain functions of a Telemetry snapshot
+// ----------------------------------------------------------------------------
+
+// The SYSTEM STATUS screen. A missing chip replaces its section with a dim "NOT INSTALLED" line.
 Element statusPanel(const Telemetry& t, bool diskOn, bool netOn) {
+    constexpr double GB = 1024.0 * 1024.0 * 1024.0;
+
     // Memory is a core system: always shown.
     double memUsedKb = static_cast<double>(t.mem.totalKb - t.mem.availableKb);
     double memFrac = t.mem.totalKb > 0 ? memUsedKb / static_cast<double>(t.mem.totalKb) : 0.0;
@@ -235,8 +256,7 @@ Element statusPanel(const Telemetry& t, bool diskOn, bool netOn) {
     if (diskOn) {
         double diskUsed = static_cast<double>(t.disk.totalBytes - t.disk.availableBytes);
         double diskFrac = t.disk.totalBytes > 0 ? diskUsed / static_cast<double>(t.disk.totalBytes) : 0.0;
-        // Right after installing the chip, the first reading hasn't arrived yet
-        // (total is still 0), so show a placeholder instead of "0 / 0 GB".
+        // Right after installing the chip the first reading hasn't arrived yet (total is 0).
         std::string diskText = t.disk.totalBytes > 0
             ? std::to_string(static_cast<long>(diskUsed / GB)) + " / " +
               std::to_string(static_cast<long>(static_cast<double>(t.disk.totalBytes) / GB)) + " GB"
@@ -250,23 +270,15 @@ Element statusPanel(const Telemetry& t, bool diskOn, bool netOn) {
     Elements netRows;
     if (netOn) {
         netRows.push_back(text("NETWORK"));
-        separator();
-        
+        // Speeds have no natural maximum, so their sparklines scale to the largest value shown.
         netRows.push_back(hbox({
-            text("  DOWNLOAD  " + kbps(t.net.rxBytesPerSec)) | size(WIDTH, EQUAL, 24),
+            text("  DOWN  " + kbps(t.net.rxBytesPerSec)) | size(WIDTH, EQUAL, 24),
+            text(sparklineAuto(t.rxHistory, kSparkWidth)) | dim,
+        }));
+        netRows.push_back(hbox({
+            text("  UP    " + kbps(t.net.txBytesPerSec)) | size(WIDTH, EQUAL, 24),
             text(sparklineAuto(t.txHistory, kSparkWidth)) | dim,
         }));
-        
-        netRows.push_back(hbox({
-            text("")
-        }));
-            
-        netRows.push_back(hbox({
-            text("  UPLOAD    " + kbps(t.net.txBytesPerSec)) | size(WIDTH, EQUAL, 24),
-            text(sparklineAuto(t.txHistory, kSparkWidth)) | dim,
-        }));
-            
-        
     } else {
         netRows.push_back(text("NETWORK [" + kChipNetwork + " NOT INSTALLED]") | dim);
     }
@@ -290,8 +302,7 @@ Element statusPanel(const Telemetry& t, bool diskOn, bool netOn) {
 }
 
 // One mounted filesystem:  [bar]  used / total GB  /mount/point
-// The path comes LAST, so a long path is never cut in the middle, and the bar
-// starts at the same column as the bars above it.
+// The path comes LAST, so a long path is never cut in the middle.
 Element mountRow(const MountInfo& m) {
     const double total = static_cast<double>(m.disk.totalBytes);
     const double avail = static_cast<double>(m.disk.availableBytes);
@@ -310,18 +321,15 @@ Element mountRow(const MountInfo& m) {
         text(" " + value + "  " + m.mountPoint),
     });
 
-    // Read-only mounts are shown, but quietly.
-    return m.readOnly ? row | dim : row;
+    return m.readOnly ? row | dim : row;   // read-only mounts are shown, but quietly
 }
 
-// Builds the SYSTEM DETAILS screen: uptime, load, swap, per-core CPU, mounts.
+// The SYSTEM DETAILS screen: uptime, load, swap, per-core CPU, mounts.
 Element detailsPanel(const Telemetry& t, bool diskOn) {
-    constexpr double GB = 1024.0 * 1024.0 * 1024.0;
     const std::size_t cores = t.corePercent.size();
 
-    // Load average means "how many processes wanted a CPU, on average". Compare it with
-    // the number of cores: a load of 4.0 on a 4-core machine means every core was busy;
-    // above that, work is waiting in line, so the line turns amber.
+    // Load average means "how many processes wanted a CPU, on average". Above the number
+    // of cores, work is waiting in line, so the line turns amber.
     Element loadLine = text("LOAD AVG   " + fixed2(t.load.one) + "  " + fixed2(t.load.five) +
                             "  " + fixed2(t.load.fifteen) + "   (1 / 5 / 15 MIN)");
     if (cores > 0 && t.load.one > static_cast<double>(cores)) {
@@ -332,7 +340,7 @@ Element detailsPanel(const Telemetry& t, bool diskOn) {
     Element swapRow;
     if (t.mem.swapTotalKb > 0) {
         double swapUsedKb = static_cast<double>(t.mem.swapTotalKb - t.mem.swapFreeKb);
-            swapRow = meter("SWAP", swapUsedKb / static_cast<double>(t.mem.swapTotalKb),
+        swapRow = meter("SWAP", swapUsedKb / static_cast<double>(t.mem.swapTotalKb),
                         std::to_string(static_cast<long>(swapUsedKb / 1024.0)) + " / " +
                         std::to_string(t.mem.swapTotalKb / 1024) + " MB",
                         "", 6, 20);
@@ -355,9 +363,6 @@ Element detailsPanel(const Telemetry& t, bool diskOn) {
             for (std::size_t i = col * perColumn; i < shownCores && i < (col + 1) * perColumn; ++i) {
                 rows.push_back(meter("C" + std::to_string(i), t.corePercent[i] / 100.0,
                                      pct(t.corePercent[i]), "", 6, 20));
-                if (i + 1 < shownCores && i + 1 < (col + 1) * perColumn) {
-                    rows.push_back(separatorLight());
-                }
             }
             columnBoxes.push_back(vbox(std::move(rows)) | flex);
             if (col + 1 < columns) {
@@ -386,6 +391,9 @@ Element detailsPanel(const Telemetry& t, bool diskOn) {
             mountRows.push_back(mountRow(m));
             ++shown;
         }
+        if (t.mounts.size() > shown) {
+            mountRows.push_back(text("... +" + std::to_string(t.mounts.size() - shown) + " MORE") | dim);
+        }
     }
 
     return vbox({
@@ -403,37 +411,35 @@ Element detailsPanel(const Telemetry& t, bool diskOn) {
     });
 }
 
-// std::size_t is unsigned integer 64-bit
-// std::size_t n = lines.size(); // .size() returns size_t not int
-// lines[0]; // index in [] is also size_t
-
-// std::ptrdiff_t is a signed integer 64-bit
-// it holds the diff between two positions in memory.
-
-// returns last count lines of a text file
-// used by system logs screen to show recent events.
+// Returns the last "count" lines of a text file (used by the SYSTEM LOGS screen).
 std::vector<std::string> readLogTail(const std::string& path, std::size_t count) {
-    std::ifstream file(path);
+    std::ifstream file(path);   // a missing file just gives an empty list
     std::vector<std::string> lines;
     std::string line;
-    while(std::getline(file, line)) {
+    while (std::getline(file, line)) {
         lines.push_back(line);
     }
-    // if there are more lines than what we want, erase oldest ones from front
-    if(lines.size() > count) {
+    if (lines.size() > count) {
         lines.erase(lines.begin(), lines.end() - static_cast<std::ptrdiff_t>(count));
     }
     return lines;
 }
 
-// =====================================================
-// MAIN
-// =====================================================
+// ============================================================================
+// main
+// ============================================================================
 
+// argc = number of command-line arguments, argv = the arguments as C strings.
+// argv[0] is the program name itself, so real arguments start at index 1.
 int main(int argc, char** argv) {
+    // ------------------------------------------------------------------
+    // COMMAND-LINE FLAGS that print something and exit (no UI, no prompt)
+    // ------------------------------------------------------------------
     for (int i = 1; i < argc; ++i) {
-        // --json: print ONE snapshot as JSON and exit. No prompt, no UI.
-        if (std::string(argv[i]) == "--json") {
+        const std::string arg = argv[i];
+
+        // --json: print ONE snapshot as JSON and exit.
+        if (arg == "--json") {
             ChipManager chips(4);
             if (!loadLoadout(chips, "loadout.json")) {
                 applyDefaultLoadout(chips);
@@ -443,22 +449,106 @@ int main(int argc, char** argv) {
         }
 
         // --forget-programs: delete the saved list of known programs and exit.
-        // The next run starts from a fresh, silent baseline.
-        if (std::string(argv[i]) == "--forget-programs") {
+        if (arg == "--forget-programs") {
             std::error_code ec;   // remove() reports problems through "ec" instead of throwing
             const bool removed = std::filesystem::remove(kKnownProgramsFile, ec);
             std::cout << (removed ? "Known-program list cleared.\n"
                                   : "No known-program list to clear.\n");
             return 0;
         }
+
+        // --init-config: write a config file with every setting at its default.
+        // It never overwrites an existing file.
+        if (arg == "--init-config") {
+            std::error_code ec;
+            if (std::filesystem::exists(kConfigFile, ec)) {
+                std::cout << kConfigFile << " already exists: not overwritten.\n";
+                return 1;
+            }
+            std::ofstream out(kConfigFile);
+            if (!out) {
+                std::cout << "Could not write " << kConfigFile << ".\n";
+                return 1;
+            }
+            out << defaultConfigJson();
+            std::cout << "Wrote " << kConfigFile << ". Edit it, then check it with --check-config.\n";
+            return 0;
+        }
+
+        // --check-config: show how the config file was understood, then exit.
+        // The exit code is 0 when there are no problems, so scripts can use it too.
+        if (arg == "--check-config") {
+            std::vector<std::string> problems;
+            const AppConfig cfg = loadConfig(kConfigFile, problems);
+            std::error_code ec;
+            std::cout << "Config file: " << kConfigFile
+                      << (std::filesystem::exists(kConfigFile, ec) ? "" : "  (not found: using defaults)")
+                      << "\n"
+                      << "  gauge_warn_percent     " << numText(cfg.gaugeWarnPercent) << "\n"
+                      << "  cpu_alert_percent      " << numText(cfg.cpuAlertPercent) << "\n"
+                      << "  mem_alert_percent      " << numText(cfg.memAlertPercent) << "\n"
+                      << "  process_alert_percent  " << numText(cfg.processAlertPercent) << "\n"
+                      << "  heartbeat_seconds      "
+                      << (cfg.heartbeatSeconds == 0 ? "off" : std::to_string(cfg.heartbeatSeconds)) << "\n"
+                      << "  expected_ports         ";
+            if (cfg.expectedPorts.empty()) {
+                std::cout << "(none)";
+            }
+            for (unsigned int port : cfg.expectedPorts) {
+                std::cout << port << " ";
+            }
+            std::cout << "\n";
+
+            std::cout << "  comms_port             " << cfg.commsPort << "\n"
+                      << "  comms_bind             " << cfg.commsBind << "\n"
+                      << "  comms_connect          ";
+            if (cfg.commsConnect.empty()) {
+                std::cout << "(none)";
+            }
+            for (const HostPort& hp : cfg.commsConnect) {
+                std::cout << hp.host << ":" << hp.port << " ";
+            }
+            std::cout << "\n  comms_allow            ";
+            if (cfg.commsAllow.empty()) {
+                std::cout << "(none)";
+            }
+            for (const std::string& host : cfg.commsAllow) {
+                std::cout << host << " ";
+            }
+            std::cout << "\n";
+
+            if (problems.empty()) {
+                std::cout << "No problems found.\n";
+            } else {
+                std::cout << "PROBLEMS (these settings were ignored):\n";
+                for (const std::string& problem : problems) {
+                    std::cout << "  - " << problem << "\n";
+                }
+            }
+            return problems.empty() ? 0 : 1;
+        }
     }
 
     logEvent(LogLevel::Info, "POD-042 Booting");
 
-    // "./build/pod042 --rename" forces the name prompt again.
-    bool askForName = false;
+    // ------------------------------------------------------------------
+    // SETTINGS: config.json (a missing file = all defaults)
+    // ------------------------------------------------------------------
+    std::vector<std::string> configProblems;
+    const AppConfig config = loadConfig(kConfigFile, configProblems);
+    for (const std::string& problem : configProblems) {
+        logEvent(LogLevel::Warning, "Config: " + problem);   // visible on the SYSTEM LOGS screen
+    }
+    gWarnFraction = config.gaugeWarnPercent / 100.0;   // set once, before any thread starts
+
+    // ------------------------------------------------------------------
+    // OPERATOR NAME: loaded from profile.json, or asked once on the first run.
+    // Must happen BEFORE the fullscreen UI, because std::cin doesn't work
+    // once FTXUI takes over the terminal.
+    // ------------------------------------------------------------------
+    bool askForName = false;   // "./build/pod042 --rename" forces the prompt again
     for (int i = 1; i < argc; ++i) {
-        if (std::string(argv[i]) == "--rename") {
+        if (std::string(argv[i]) == "--rename") {   // wrap in std::string so == compares text
             askForName = true;
         }
     }
@@ -467,71 +557,65 @@ int main(int argc, char** argv) {
     if (askForName || !loadName(userName, "profile.json")) {
         std::cout << "POD 042: ENTER OPERATOR DESIGNATION: ";
         std::getline(std::cin, userName);
-        userName = trim(userName);
+        userName = trimSpaces(userName);
         if (userName.empty()) {
             userName = "UNIT";
         }
         saveName(userName, "profile.json");
     }
 
-    // =====================================================
-    // 1. CHIPS: create manager and restore saved loadout.
-    // =====================================================
-
+    // ------------------------------------------------------------------
+    // 1. CHIPS
+    // ------------------------------------------------------------------
     ChipManager chips(4);
-
-    // try to restore the saved loadout; on the first run there's no file yet.
     if (!loadLoadout(chips, "loadout.json")) {
         applyDefaultLoadout(chips);   // first run: no saved loadout yet
     }
 
-    std::vector<std::string> chipLabels; // text of each menu line
-    int chipSelected = 0; // index of highlighted chip
-    std::string chipMessage; // feedback line eg not enough slots
+    std::vector<std::string> chipLabels;   // the text of each menu line
+    int chipSelected = 0;                  // index of the highlighted chip
+    std::string chipMessage;               // feedback line, e.g. "NOT ENOUGH SLOTS"
 
-    // The UI thread WRITES them (inside updateLabels); the refresher thread only READS them.
+    // "Which chips are on" as thread-safe flags. The UI thread WRITES them (inside
+    // updateLabels); the other threads only READ them. The ChipManager itself is never
+    // touched from another thread: that would be a data race.
     std::atomic<bool> netEnabled{false};
     std::atomic<bool> diskEnabled{false};
     std::atomic<bool> logEnabled{false};
     std::atomic<bool> processEnabled{false};
+    std::atomic<bool> commsEnabled{false};
 
-    // lambda: small unnamed function stored  in a variable
-    // [&] = capture: the lambda can use the variables around 
-    // it by reference, not by copy
-    // this one rebuilds menu text from the chip manager's current state
-    // so ON and OFF is always up to date
-
+    // A LAMBDA: a small unnamed function stored in a variable. [&] lets it use the
+    // variables around it (chips, chipLabels, ...) by reference. This one rebuilds
+    // the menu text AND refreshes the flags, so every install/remove updates both.
     auto updateLabels = [&] {
         chipLabels.clear();
-        for(const Chip& c : chips.chips()) {
-            chipLabels.push_back((c.enabled ? "[ON] " : "[OFF] ") + c.name + 
-                                " (cost " + std::to_string(c.cost) + ")"); 
+        for (const Chip& c : chips.chips()) {
+            chipLabels.push_back((c.enabled ? "[ON]  " : "[OFF] ") + c.name +
+                                 "  (cost " + std::to_string(c.cost) + ")");
         }
-        netEnabled  = chips.isEnabled(kChipNetwork);
-        diskEnabled = chips.isEnabled(kChipDisk);
-        logEnabled  = chips.isEnabled(kChipLog);
+        netEnabled     = chips.isEnabled(kChipNetwork);
+        diskEnabled    = chips.isEnabled(kChipDisk);
+        logEnabled     = chips.isEnabled(kChipLog);
         processEnabled = chips.isEnabled(kChipProcess);
+        commsEnabled   = chips.isEnabled(kChipComms);
     };
+    updateLabels();
 
-    updateLabels(); // fill labels once before UI starts
-
-    // MenuOption lets us customize menu
+    // Enter on a chip toggles it, then saves the loadout.
     MenuOption chipOption = MenuOption::Vertical();
     chipOption.on_enter = [&] {
         std::string name = chips.chips()[static_cast<std::size_t>(chipSelected)].name;
         bool wasEnabled = chips.isEnabled(name);
 
-        // Toggle it: remove if installed, install if not.
         ChipResult result = wasEnabled ? chips.disable(name) : chips.enable(name);
-        // if install refused, tell user, else nothing
         chipMessage = (result == ChipResult::NotEnoughSlots) ? "NOT ENOUGH SLOTS" : "";
 
         updateLabels();
         saveLoadout(chips, "loadout.json");
-
     };
 
-        // Switches to the preset at "index" (0 = first preset), then saves the result.
+    // Switches to the preset at "index" (0 = first preset), then saves the result.
     auto selectPreset = [&](std::size_t index) {
         const std::vector<Preset>& all = presets();
         if (index >= all.size()) {
@@ -539,68 +623,80 @@ int main(int argc, char** argv) {
         }
         applyPreset(chips, all[index].name);
         chipMessage = "LOADOUT: " + all[index].name;
-        updateLabels();                      // refreshes the menu text and the chip flags
+        updateLabels();
         saveLoadout(chips, "loadout.json");
     };
 
-    // =====================================================
-    // 2. TELEMETRY
-    // =====================================================
-    // Two threads, use mutex for locking.
-    std::mutex telemtryMutex;
+    // ------------------------------------------------------------------
+    // 2. TELEMETRY: shared data
+    // ------------------------------------------------------------------
+    // Two threads (UI and refresher) use "telemetry". A mutex is a lock: only the
+    // thread holding it may touch the data; the other waits.
+    std::mutex telemetryMutex;
     Telemetry telemetry;
-    telemetry.mem = readMemInfo();
-    if(diskEnabled) {
-        telemetry.disk=readDiskInfo("/");
+    telemetry.mem = readMemInfo();   // fill once now so the first frame isn't empty
+    if (diskEnabled) {
+        telemetry.disk = readDiskInfo("/");
     }
 
-    // a small helper that returns COPY of shared telemetry
-    // lock is held only while copying, then released at closing brace
-    // several places need snapshot, so this avoids repeating the locking code.
+    // Returns a COPY of the shared telemetry; the lock is held only while copying.
     auto snapshotTelemetry = [&] {
-        std::lock_guard<std::mutex> lock(telemtryMutex);
+        std::lock_guard<std::mutex> lock(telemetryMutex);
         return telemetry;
     };
 
     auto screen = ScreenInteractive::Fullscreen();
 
-    // bool safe to read in one thread and wrie in another without mutex
-    // refresher checks it to know when to stop
+    // atomic<bool>: a bool that is safe to read in one thread and write in another.
     std::atomic<bool> running{true};
 
+    // ---- COMMS: messages between pods ----
+    // "comms" is declared AFTER "screen", so it is destroyed BEFORE it: the node's thread
+    // calls screen.PostEvent, so the screen must outlive the node.
+    CommsConfig commsConfig;
+    commsConfig.localName = trimSpaces(sanitizeText(userName, kMaxPeerNameBytes));
+    if (commsConfig.localName.empty()) {
+        commsConfig.localName = "UNIT";
+    }
+    commsConfig.bindAddress = config.commsBind;
+    commsConfig.port = config.commsPort;
+    commsConfig.connectTo = config.commsConnect;
+    commsConfig.allowFrom = config.commsAllow;
+
+    CommsNode comms;
+    // Whenever a message arrives or a link changes, ask the UI to redraw right away.
+    comms.setOnChange([&] { screen.PostEvent(Event::Custom); });
+
+    // ------------------------------------------------------------------
+    // 3. THE REFRESHER THREAD: reads the system once per second
+    // ------------------------------------------------------------------
     std::thread refresher([&] {
+        // Rates (CPU, network) need a PREVIOUS reading, so we keep one.
         cpuInfo prevCpu = readCpuInfo();
-        NetInfo prevNet = readNetInfo();
+        std::vector<cpuInfo> prevCores = readCoreCpuInfo();
+        NetInfo prevNet;                     // all zeros until the first real reading
         auto prevTime = std::chrono::steady_clock::now();
-        ProcessSampler processSampler;   // keeps its own previous sample
-        std::set<int> alertedPids;       // processes currently flagged as high CPU
 
-        bool cpuAlertActive = false;
-
+        // false while the network chip is off. After the chip is (re)installed, the
+        // first reading only primes prevNet; real rates start with the second.
         bool netPrimed = false;
 
-        // For the Pod heartbeat
+        bool cpuAlertActive = false;         // log only when the state CHANGES
+
+        // For the Pod heartbeat: when the thread started, and when we last reported.
         const auto startTime = std::chrono::steady_clock::now();
         auto lastHeartbeat = startTime;
 
-        History cpuHist(kHistorySamples);
-        History memHist(kHistorySamples);
-        History rxHist(kHistorySamples);
-        History txHist(kHistorySamples);
+        // PROCESS WATCH state.
+        ProcessSampler processSampler;       // keeps its own previous sample
+        std::set<int> alertedPids;           // processes currently flagged as high CPU
 
-        // Per-core CPU needs a previous reading, just like the total.
-        std::vector<cpuInfo> prevCores = readCoreCpuInfo();
-
-        // Mounted filesystems change rarely and cost one statvfs() call each, so they are
-        // read every 5th second (and immediately when the chip is installed).
-        std::vector<MountInfo> mounts;
-        bool mountsWereOn = false;
-        int mountTick = 0;
-
-        ChangeDetector detector;   // remembers the previous sample for the event feed
-
+        // The event feed: compares each sample with the previous one.
+        ChangeDetector detector;
+        // Start from the programs seen in earlier runs (empty on the very first run).
         detector.loadKnownPrograms(loadKnownPrograms(kKnownProgramsFile));
         std::size_t savedProgramCount = detector.knownPrograms().size();
+
         // Writes detected changes to the log. Every check below passes its result through here.
         auto publish = [&](std::vector<Change> changes) {
             if (changes.empty()) {
@@ -608,9 +704,8 @@ int main(int argc, char** argv) {
             }
             limitChanges(changes, kMaxChangesPerSample);
 
-            // Finding a socket's owner scans every process's open files, which is
-            // expensive. Do it only when a change involves a socket AND the
-            // PROCESS WATCH chip is installed.
+            // Finding a socket's owner scans every process's open files, which is expensive.
+            // Do it only when a change involves a socket AND PROCESS WATCH is installed.
             std::map<unsigned long long, SocketOwner> owners;
             const bool needOwners = processEnabled &&
                 std::any_of(changes.begin(), changes.end(),
@@ -632,22 +727,40 @@ int main(int argc, char** argv) {
             }
         };
 
-        
+        // History for the sparklines: one value per second, oldest first.
+        History cpuHist(kHistorySamples);
+        History memHist(kHistorySamples);
+        History rxHist(kHistorySamples);
+        History txHist(kHistorySamples);
 
-        while(running) {
-            // sleep 1 second
-            for(int i = 0; i < 10 && running; ++i) {
+        // Mounted filesystems change rarely and cost one statvfs() call each, so they are
+        // read every 5th second (and immediately when the chip is installed).
+        std::vector<MountInfo> mounts;
+        bool mountsWereOn = false;
+        int mountTick = 0;
+
+        while (running) {
+            // Sleep 1 second as ten 100 ms naps, so quitting is noticed within 100 ms.
+            for (int i = 0; i < 10 && running; ++i) {
                 std::this_thread::sleep_for(std::chrono::milliseconds(100));
             }
-            if(!running) break;
+            if (!running) break;
 
+            // COMMS chip: keep the message link in step with the chip.
+            if (commsEnabled && !comms.running()) {
+                comms.start(commsConfig);
+            } else if (!commsEnabled && comms.running()) {
+                comms.stop();
+            }
+
+            // Second sample for the rates.
             cpuInfo nowCpu = readCpuInfo();
             std::vector<cpuInfo> nowCores = readCoreCpuInfo();
             auto nowTime = std::chrono::steady_clock::now();
             double seconds = std::chrono::duration<double>(nowTime - prevTime).count();
 
-            Telemetry t;
-            t.mem  = readMemInfo();
+            Telemetry t;                     // a fresh snapshot; fields default to zero
+            t.mem = readMemInfo();           // core systems: always read
             t.cpuPercent = cpuUsagePercent(prevCpu, nowCpu);
             t.load = readLoadAvg();
             t.uptimeSeconds = readUptimeSeconds();
@@ -660,8 +773,9 @@ int main(int argc, char** argv) {
             cpuHist.push(t.cpuPercent);
             memHist.push(memPercent);
 
-            // Mounted filesystems (DISK MONITOR chip).
+            // DISK MONITOR chip: disk usage and the mount list.
             if (diskEnabled) {
+                t.disk = readDiskInfo("/");
                 if (!mountsWereOn || mountTick % 5 == 0) {
                     mounts = readMounts();
                 }
@@ -674,46 +788,23 @@ int main(int argc, char** argv) {
                 mountTick = 0;   // reinstalling the chip reads right away
             }
 
-            if(diskEnabled) {
-                t.disk = readDiskInfo("/");
-            }
-
-            // NETWORK WATCH
-            if (netEnabled) {
-                NetInfo nowNet = readNetInfo();
-                if (netPrimed) {
-                    t.net = netRates(prevNet, nowNet, seconds);
-                    rxHist.push(t.net.rxBytesPerSec);   // NEW
-                    txHist.push(t.net.txBytesPerSec);   // NEW
-                }
-                prevNet = nowNet;
-                netPrimed = true;
-
-                // Event feed: new listeners and new connections since the last sample.
-                publish(detector.checkConnections(readConnections()));
-            } else {
-                netPrimed = false;               // forget the old reading
-                detector.resetConnections();     // and the old connection list
-                rxHist.clear();                  // NEW: an old graph would be misleading
-                txHist.clear();
-            }
-
-            // PROCESS WATCH: sample all processes, but only while the chip is installed.
+            // PROCESS WATCH chip: sample all processes, only while the chip is installed.
             if (processEnabled) {
                 std::vector<ProcessInfo> procs = processSampler.sample(nowCpu);
                 t.processCount = procs.size();
                 publish(detector.checkProcesses(procs));   // log programs seen for the first time
 
+                // Save the list whenever it grew. We update the counter even if the save
+                // failed: otherwise a failing disk would retry (and log) every second.
                 if (detector.knownPrograms().size() != savedProgramCount) {
                     saveKnownPrograms(detector.knownPrograms(), kKnownProgramsFile);
                     savedProgramCount = detector.knownPrograms().size();
                 }
 
-                // Log a warning when a process CROSSES the threshold (not every second):
-                // same edge-detection idea as the system CPU alert, but per process.
+                // Log a warning when a process CROSSES the threshold (not every second).
                 std::set<int> stillHigh;
                 for (const ProcessInfo& p : procs) {
-                    if (p.cpuPercent > 80.0) {
+                    if (p.cpuPercent > config.processAlertPercent) {
                         stillHigh.insert(p.pid);
                         if (alertedPids.count(p.pid) == 0) {   // count() is 0 if not in the set
                             logEvent(LogLevel::Warning,
@@ -730,21 +821,43 @@ int main(int argc, char** argv) {
                 }
                 t.processes = std::move(procs);
             } else {
-                processSampler.reset();   // chip removed: forget the old sample
+                processSampler.reset();      // chip removed: forget the old sample
                 alertedPids.clear();
                 detector.resetProcesses();   // reinstalling starts a fresh baseline
             }
 
-            bool cpuHigh = t.cpuPercent > 80.0;
-            if(cpuHigh && !cpuAlertActive) {
+            // NETWORK SCAN chip: speeds, sparklines and the connection feed.
+            if (netEnabled) {
+                NetInfo nowNet = readNetInfo();
+                if (netPrimed) {
+                    t.net = netRates(prevNet, nowNet, seconds);
+                    rxHist.push(t.net.rxBytesPerSec);
+                    txHist.push(t.net.txBytesPerSec);
+                }
+                prevNet = nowNet;
+                netPrimed = true;
+
+                // Event feed: new listeners and new connections since the last sample.
+                publish(detector.checkConnections(readConnections()));
+            } else {
+                netPrimed = false;               // forget the old reading
+                detector.resetConnections();     // and the old connection list
+                rxHist.clear();                  // an old graph would be misleading
+                txHist.clear();
+            }
+
+            // System CPU alert: log only when the state changes (normal <-> high).
+            bool cpuHigh = t.cpuPercent > config.cpuAlertPercent;
+            if (cpuHigh && !cpuAlertActive) {
                 logEvent(LogLevel::Warning, "CPU usage high: " + pct(t.cpuPercent));
-            } else if(!cpuHigh && cpuAlertActive) {
+            } else if (!cpuHigh && cpuAlertActive) {
                 logEvent(LogLevel::Info, "CPU usage back to normal");
             }
             cpuAlertActive = cpuHigh;
 
-            // Pod heartbeat: once every kHeartbeatSeconds, one line in the log.
-            if (nowTime - lastHeartbeat >= std::chrono::seconds(kHeartbeatSeconds)) {
+            // Pod heartbeat: once every heartbeat_seconds (0 in config.json = off).
+            if (config.heartbeatSeconds > 0 &&
+                nowTime - lastHeartbeat >= std::chrono::seconds(config.heartbeatSeconds)) {
                 double uptime = std::chrono::duration<double>(nowTime - startTime).count();
                 logEvent(LogLevel::Info, podHeartbeat(t.cpuPercent, memPercent, uptime));
                 lastHeartbeat = nowTime;
@@ -757,21 +870,25 @@ int main(int argc, char** argv) {
             t.txHistory = txHist.values();
 
             {
-                std::lock_guard<std::mutex> lock(telemtryMutex);
-                telemetry = t;
+                // lock_guard locks the mutex here and unlocks it at the closing brace.
+                std::lock_guard<std::mutex> lock(telemetryMutex);
+                telemetry = t;   // swap in the new snapshot
             }
 
+            // This sample becomes the "previous" one for the next round.
             prevCpu = nowCpu;
-            prevTime  = nowTime;
             prevCores = nowCores;
+            prevTime = nowTime;
 
+            // Ask the UI to redraw. PostEvent is safe to call from another thread.
             screen.PostEvent(Event::Custom);
         }
     });
-    // =====================================================
-    // 3. BOOT SEQUENCE
-    // =====================================================
 
+    // ------------------------------------------------------------------
+    // 4. BOOT SEQUENCE (typewriter)
+    // ------------------------------------------------------------------
+    // Some lines contain real data (the chip loadout and the operator name).
     const std::vector<std::string> bootLines = {
         "POD 042: INITIALIZING ANDROID SYSTEMS...",
         "MEMORY BANKS ............ OK",
@@ -783,9 +900,10 @@ int main(int argc, char** argv) {
         "ALL SYSTEMS NOMINAL. WELCOME, " + toUpper(userName) + ".",
     };
 
-        std::atomic<bool> booting{true};
+    std::atomic<bool> booting{true};
 
-    
+    // How many bytes of the boot text are visible so far, counted across ALL lines
+    // as if they were one long text.
     std::atomic<std::size_t> bootChars{0};
 
     // Total size of the boot text, used for the progress bar.
@@ -795,8 +913,6 @@ int main(int argc, char** argv) {
     }
 
     // Sleeps "ms" milliseconds in 10 ms slices; wakes early on skip or quit.
-    // Slices must be shorter than the per-character delay, or the typing speed
-    // would be rounded up to the slice length.
     auto nap = [&](int ms) {
         for (int waited = 0; waited < ms && booting && running; waited += 10) {
             std::this_thread::sleep_for(std::chrono::milliseconds(10));
@@ -839,19 +955,18 @@ int main(int argc, char** argv) {
         std::size_t remaining = shown;
         for (const std::string& line : bootLines) {
             if (remaining == 0) {
-                break;   // nothing left to show for this or any later line
+                break;
             }
             if (remaining >= line.size()) {
                 rows.push_back(text(line));
                 remaining -= line.size();
             } else {
-                // "█" is a block cursor at the point where typing currently is.
-                rows.push_back(text(line.substr(0, remaining) + "█"));
+                rows.push_back(text(line.substr(0, remaining) + "█"));   // block cursor
                 remaining = 0;
             }
         }
         if (shown == 0) {
-            rows.push_back(text("█"));   // before the first character, show only the cursor
+            rows.push_back(text("█"));
         }
 
         rows.push_back(separator());
@@ -861,35 +976,35 @@ int main(int argc, char** argv) {
         return vbox(std::move(rows)) | border | size(WIDTH, EQUAL, 56) | center;
     };
 
-    // =====================================================
-    // 4. UI
-    // =====================================================
-    // Element: something you draw
-    // Component: something that draws and reacts to input
-    // Renderer() turns a function that returns an element into a component
+    // ------------------------------------------------------------------
+    // 5. UI COMPONENTS
+    //
+    // Element   = something you DRAW (text, gauge, vbox).
+    // Component = something that draws AND reacts to input (a menu, a tab view).
+    // Renderer(...) turns a function that returns an Element into a Component.
+    // ------------------------------------------------------------------
 
-    // Left menu: list of screens. "tab" holds the selected index
-    // menu stores the address of "tab" and updates it as you move
+    // Left menu: the list of screens. "tab" holds the selected index; the menu
+    // stores the address of "tab" and updates it as you move.
     std::vector<std::string> tabNames = {"SYSTEM STATUS", "SYSTEM DETAILS",
                                          "NETWORK CONNECTIONS", "PROCESS WATCH",
-                                         "CHIP CONFIGURATION", "SYSTEM LOGS"};
+                                         "CHIP CONFIGURATION", "COMMS", "SYSTEM LOGS"};
     int tab = 0;
     Component tabMenu = Menu(&tabNames, &tab, MenuOption::Vertical());
 
-    // Screen: status
-    // This lambda runs every time the screen is redrawn
+    // Screen 0: status.
     Component statusView = Renderer([&] {
         return statusPanel(snapshotTelemetry(), diskEnabled, netEnabled);
     });
 
-    // Screen: system details (uptime, load, swap, per-core CPU, mounts).
+    // Screen 1: details (uptime, load, swap, per-core CPU, mounts).
     Component detailsView = Renderer([&] {
         return detailsPanel(snapshotTelemetry(), diskEnabled);
     });
 
-    // Screen: network connections. Only works if the NETWORK SCAN chip is installed.
-    // It reads /proc/net/tcp directly each time it's drawn. That's cheap, and it
-    // keeps this screen free of shared state, so no mutex is needed.
+    // Screen 2: network connections. Only works if the NETWORK SCAN chip is installed.
+    // It reads /proc/net/tcp(6) directly each time it's drawn: cheap, and it keeps this
+    // screen free of shared state, so no mutex is needed.
     Component connectionsView = Renderer([&]() -> Element {
         if (!netEnabled) {
             return vbox({
@@ -908,7 +1023,6 @@ int main(int argc, char** argv) {
             owners = readSocketOwners();
         }
 
-        // Count a few states for the summary line.
         std::size_t established = 0;
         std::size_t listening = 0;
         for (const Connection& c : conns) {
@@ -924,6 +1038,7 @@ int main(int argc, char** argv) {
                             "   TOTAL: " + std::to_string(conns.size())));
         rows.push_back(separator());
         rows.push_back(text(formatRow("STATE", "LOCAL", "REMOTE", "OWNER")) | dim);
+
         const std::size_t maxRows = 15;   // keep the table inside the window
         std::size_t shown = 0;
         for (const Connection& c : conns) {
@@ -944,10 +1059,10 @@ int main(int argc, char** argv) {
                                          endpoint(c.remoteAddr, c.remotePort),
                                          owner));
 
-            // A LISTEN socket bound to 0.0.0.0 accepts connections on EVERY network
-            // interface, so it's reachable from outside this machine. That deserves
-            // a visual flag. A socket bound to 127.0.0.1 only accepts local traffic.
-            if (c.state == "LISTEN" && (c.localAddr == "0.0.0.0" || c.localAddr == "::")) {
+            // A LISTEN socket bound to 0.0.0.0 or :: accepts connections on EVERY interface,
+            // so it is reachable from outside. Amber, unless its port is in expected_ports.
+            if (c.state == "LISTEN" && isWildcardAddress(c.localAddr) &&
+                config.expectedPorts.count(c.localPort) == 0) {
                 row = row | color(kAmber);
             }
             rows.push_back(row);
@@ -958,11 +1073,14 @@ int main(int argc, char** argv) {
             rows.push_back(text("... +" + std::to_string(conns.size() - shown) + " more") | dim);
         }
         rows.push_back(separator());
-        rows.push_back(text("AMBER = LISTENING ON ALL INTERFACES (0.0.0.0 / ::).  ? = OWNER NOT VISIBLE WITHOUT ROOT") | dim);
+        rows.push_back(text(std::string(config.expectedPorts.empty()
+                                ? "AMBER = LISTENING ON ALL INTERFACES (0.0.0.0 / ::)."
+                                : "AMBER = ALL INTERFACES, PORT NOT IN expected_ports.") +
+                            "  ? = OWNER NOT VISIBLE WITHOUT ROOT") | dim);
         return vbox(std::move(rows));
     });
 
-    // Screen: process watch. Only works if the PROCESS WATCH chip is installed.
+    // Screen 3: process watch. Only works if the PROCESS WATCH chip is installed.
     Component processesView = Renderer([&]() -> Element {
         if (!processEnabled) {
             return vbox({
@@ -992,25 +1110,32 @@ int main(int argc, char** argv) {
             Element row = text(formatProcessRow(std::to_string(p.pid), p.name,
                                                 pct(p.cpuPercent),
                                                 std::to_string(p.rssKb / 1024) + " MB"));
-            if (p.cpuPercent > 80.0) {
+            if (p.cpuPercent > config.processAlertPercent) {
                 row = row | color(kAmber);   // same threshold as the log warning
             }
             rows.push_back(row);
         }
 
         rows.push_back(separator());
-        rows.push_back(text("AMBER = CPU ABOVE 80% (ALSO LOGGED). 100% = ONE FULL CORE.") | dim);
+        rows.push_back(text("AMBER = CPU ABOVE " + numText(config.processAlertPercent) +
+                            "% (ALSO LOGGED). 100% = ONE FULL CORE.") | dim);
         return vbox(std::move(rows));
     });
 
-    // Screen 2: chips
-    // Remderer(child, fn): child receives key presses; fn decides how everything is drawm
-    // Inside fn, chipMenu->Render() draws the list itself.
+    // Screen 4: chips (interactive menu plus a slot gauge and the presets).
     Component chipMenu = Menu(&chipLabels, &chipSelected, chipOption);
     Component chipsView = Renderer(chipMenu, [&] {
         double used = chips.usedSlots();
         double total = chips.totalSlots();
         const Chip& selected = chips.chips()[static_cast<std::size_t>(chipSelected)];
+
+        // Build "PRESETS:  [1] DIAGNOSTIC  [2] EXPLORATION ..." from the preset list,
+        // so adding a preset in loadout.cpp updates the screen too.
+        std::string presetLine = "PRESETS:";
+        const std::vector<Preset>& all = presets();
+        for (std::size_t i = 0; i < all.size(); ++i) {
+            presetLine += "  [" + std::to_string(i + 1) + "] " + all[i].name;
+        }
 
         return vbox({
             text("CHIP CONFIGURATION") | bold,
@@ -1023,102 +1148,204 @@ int main(int argc, char** argv) {
             text(selected.description) | dim,
             text(chipMessage) | bold | color(kAmber),
             separator(),
-            text("PRESETS:"),
-            text("[1] DIAGNOSTIC"),
-            text("[2] EXPLORATION"),
-            text("[3] Security"),
-            
-            separatorEmpty(),
+            text(presetLine),
             text("RIGHT: focus list   ENTER: install / remove   1-3: load preset") | dim,
         });
     });
 
-    // Screen 3: the last 20 lines of the event log, re-read on every redraw
-    Component logsView = Renderer([&] {
-        Elements rows;
-        rows.push_back(text("System LOGS") | bold);
-        rows.push_back(separator());
-        for(const std::string& line : readLogTail("pod042.log", 20)) {
-            Element row = text(line);
-            if(line.find("[WARN]") != std::string::npos) {
+    // Screen 5: comms (messages to other pods).
+    std::string commsText;   // what the user is typing; the Input component edits it directly
+    InputOption commsOption;
+    commsOption.on_enter = [&] {   // called when ENTER is pressed inside the box
+        if (!commsEnabled) {
+            return;
+        }
+        if (comms.send(commsText)) {
+            commsText.clear();     // sent: empty the box
+        }
+    };
+    Component commsInput = Input(&commsText, "type a message, ENTER to send", commsOption);
+
+    // Renderer(child, fn): the child gets the key presses, fn draws everything.
+    Component commsView = Renderer(commsInput, [&]() -> Element {
+        if (!commsEnabled) {
+            return vbox({
+                text("COMMS") | bold,
+                separator(),
+                text(kChipComms + " CHIP NOT INSTALLED") | color(kAmber),
+                text("Install it on the CHIP CONFIGURATION screen.") | dim,
+            });
+        }
+
+        const CommsSnapshot snap = comms.snapshot();   // one consistent copy for this frame
+
+        std::string mode = "STARTING...";
+        if (snap.running) {
+            mode = snap.listening ? "LISTENING ON " + snap.listenText : "NOT LISTENING (DIAL-OUT ONLY)";
+        }
+
+        Elements linkRows;
+        if (snap.links.empty()) {
+            linkRows.push_back(text("  NO LINKS") | dim);
+        }
+        for (const CommsLink& link : snap.links) {
+            const std::string who = link.ready ? link.name : "(CONNECTING)";
+            linkRows.push_back(text(std::string(link.ready ? "  LINKED   " : "  PENDING  ") + who +
+                                    "  " + link.address + (link.outbound ? "  (OUT)" : "  (IN)")));
+        }
+
+        // Newest first, so the box and the latest messages stay at the top of the screen.
+        Elements history;
+        const std::size_t total = snap.lines.size();
+        const std::size_t shownCount = std::min<std::size_t>(total, 10);
+        for (std::size_t i = 0; i < shownCount; ++i) {
+            const CommsLine& line = snap.lines[total - 1 - i];
+            // paragraph() wraps long text over several lines instead of cutting it off.
+            Element row = paragraph("[" + line.time + "] " + line.text);
+            if (line.kind == CommsKind::Outgoing) {
+                row = row | dim;
+            } else if (line.kind == CommsKind::System) {
                 row = row | color(kAmber);
-            } else if(line.find("[ERROR]") != std::string::npos) {
+            }
+            history.push_back(row);
+        }
+        if (history.empty()) {
+            history.push_back(text("NO TRANSMISSIONS YET") | dim);
+        }
+
+        return vbox({
+            text("COMMS") | bold,
+            separator(),
+            text(mode),
+            text("UNENCRYPTED LINK: TRUSTED LOCAL NETWORKS ONLY") | color(kAmber),
+            separator(),
+            vbox(std::move(linkRows)),
+            separator(),
+            hbox({text("> "), commsInput->Render() | flex}) | border,
+            vbox(std::move(history)),
+            separator(),
+            text("RIGHT: focus message box   ENTER: send   ESC: back to menu") | dim,
+        });
+    });
+
+    // Screen 6: the last lines of the event log. Only works if LOG STREAM is installed
+    // (the log FILE is written either way; the chip only controls viewing).
+    Component logsView = Renderer([&]() -> Element {
+        if (!logEnabled) {
+            return vbox({
+                text("SYSTEM LOGS") | bold,
+                separator(),
+                text(kChipLog + " CHIP NOT INSTALLED") | color(kAmber),
+                text("Install it on the CHIP CONFIGURATION screen.") | dim,
+            });
+        }
+
+        Elements rows;
+        rows.push_back(text("SYSTEM LOGS") | bold);
+        rows.push_back(separator());
+        for (const std::string& line : readLogTail("pod042.log", 20)) {
+            // find() returns std::string::npos when the text is NOT found.
+            Element row = text(line);
+            if (line.find("[WARN]") != std::string::npos) {
+                row = row | color(kAmber);
+            } else if (line.find("[ERROR]") != std::string::npos) {
                 row = row | color(Color::Red);
             }
-            rows.push_back(text(line));
+            rows.push_back(row);
         }
-        return vbox(std::move(rows));
+        return vbox(std::move(rows));   // std::move hands the vector over without copying
     });
-    // Container::Tab holds several components but shows only the one at index
-    // "tab" (the left menu's selection).
+
+    // Container::Tab shows only the panel selected by the left menu (same order as tabNames!).
     Component tabs = Container::Tab(
-        {statusView, detailsView, connectionsView, processesView, chipsView, logsView}, &tab);
+        {statusView, detailsView, connectionsView, processesView, chipsView, commsView, logsView}, &tab);
 
     // Container::Horizontal groups the left menu and the right panel, so
     // Left/Right arrow keys move focus between them.
     Component layout = Container::Horizontal({tabMenu, tabs});
 
+    // The root component: boot screen first, then header + menu + active screen + footer.
     Component root = Renderer(layout, [&]() -> Element {
-        if(booting) {
+        if (booting) {
             return bootScreen();
         }
 
+        // The header's status line reflects the live CPU state.
         Telemetry snap = snapshotTelemetry();
-        Element statusLine = snap.cpuPercent > 80.0
+        Element statusLine = snap.cpuPercent > config.cpuAlertPercent
             ? text("POD 042: WARNING. CPU LOAD EXCEEDS THRESHOLD.") | bold | color(kAmber)
-            : text("SYSTEM STATUS: OPERATIONAL") | bold;
-        
-        
+            : text("SYSTEM STATUS: OPERATIONAL");
+
         return vbox({
-            // Header box
             vbox({
                 text("YoRHa // UNIT DIAGNOSTICS") | bold,
-                text("NAME: " + userName) | bold,
+                text("NAME: " + userName),
                 statusLine,
             }) | border,
-            // Middle: menu on the left, active screen on the right
             hbox({
                 tabMenu->Render() | border | size(WIDTH, EQUAL, 28),
-                tabs->Render() | border | flex, 
-            }) | flex,
-            // Footer hint
-            text(" UP/DOWN: select  |  LEFT/RIGHT: switch focus  |  Q: quit ") | dim,
+                tabs->Render() | border | flex,
+            }) | flex,   // flex here = take all remaining vertical space
+            text(" UP/DOWN: select   LEFT/RIGHT: switch focus   Q: quit ") | dim,
         });
     });
 
-    root = CatchEvent(root, [&](Event event){
-        if(booting) {
-            if(event==Event::Custom || event.is_mouse()){
+    // CatchEvent wraps a component and sees every key press first. Returning true
+    // means "handled" (nothing else sees the key); false lets the components process it.
+    root = CatchEvent(root, [&](Event event) {
+        // During the boot sequence, any key skips it.
+        if (booting) {
+            // Our own redraw requests and mouse movement must not skip the boot.
+            if (event == Event::Custom || event.is_mouse()) {
                 return false;
             }
             booting = false;
             return true;
         }
 
+        // While the message box has focus, EVERY key belongs to it: typing "quit" must not
+        // close the program, and typing "3" must not switch presets.
+        // ESC is the way out: it hands the focus back to the left-hand menu.
+        if (tab == kTabComms && commsEnabled && commsInput->Focused()) {
+            if (event == Event::Escape) {
+                tabMenu->TakeFocus();
+                return true;
+            }
+            return false;   // not handled here: the Input component gets the key
+        }
+
         // On the chip screen, keys 1..9 load the matching preset.
+        // event.is_character() is true for printable keys; event.character() is that key
+        // as a std::string, so [0] is the key itself.
         if (tab == kTabChips && event.is_character()) {
             char key = event.character()[0];
             if (key >= '1' && key <= '9') {
                 selectPreset(static_cast<std::size_t>(key - '1'));   // '1' -> 0, '2' -> 1, ...
-                return true;   // handled: the key does nothing else
+                return true;
             }
         }
-        
-        if(event==Event::Character('q') || event==Event::Character('Q')) {
+
+        if (event == Event::Character('q') || event == Event::Character('Q')) {
+            // ExitLoopClosure() returns a function that stops the app; the second () calls it.
             screen.ExitLoopClosure()();
             return true;
         }
         return false;
     });
 
-    // 5. RUN: blocks here, drawing and handling keys, until Q is pressed
+    // ------------------------------------------------------------------
+    // 6. RUN: blocks here, drawing and handling keys, until Q is pressed
+    // ------------------------------------------------------------------
     screen.Loop(root);
 
-    // 6. SHUTDOWN: stop background thread cleanly
-    running = false; // tell refresher loop to stop
-    booting = false;
-    refresher.join(); // wait until it has actually finished
-    bootThread.join();
-    logEvent(LogLevel::Info, "POD-042 Shutdown.");
+    // ------------------------------------------------------------------
+    // 7. SHUTDOWN: stop every background thread cleanly
+    // ------------------------------------------------------------------
+    running = false;     // tell the refresher loop to stop
+    booting = false;     // and the boot thread
+    refresher.join();    // wait until each thread has actually finished.
+    bootThread.join();   // (Destroying a std::thread that was never joined crashes the program.)
+    comms.stop();        // closes every socket and joins the I/O thread
+    logEvent(LogLevel::Info, "POD-042 Shutdown");
     return 0;
 }

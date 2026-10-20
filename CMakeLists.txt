@@ -50,7 +50,7 @@ endfunction()
 add_library(pod042_core STATIC
     meminfo.cpp cpu.cpp disk.cpp net.cpp log.cpp chips.cpp
     loadout.cpp profile.cpp connections.cpp process.cpp
-    snapshot.cpp pod.cpp changes.cpp knownprograms.cpp history.cpp host.cpp)
+    snapshot.cpp pod.cpp changes.cpp programs.cpp history.cpp host.cpp config.cpp protocol.cpp comms.cpp)
 
 # PUBLIC = anything that links this library also gets these settings.
 # The headers sit in the project folder, so the tests can write #include "cpu.h".
@@ -63,6 +63,26 @@ add_executable(pod042 main.cpp)
 target_link_libraries(pod042 PRIVATE
     pod042_core ftxui::screen ftxui::dom ftxui::component)
 pod042_configure(pod042)
+
+# Tests are built only if they are switched on AND the test file exists.
+if(POD042_HAVE_TESTS)
+    FetchContent_Declare(googletest
+        URL https://github.com/google/googletest/archive/refs/tags/v1.14.0.zip
+        DOWNLOAD_EXTRACT_TIMESTAMP TRUE)
+    FetchContent_MakeAvailable(googletest)
+endif()
+
+# ---- The tests ----
+if(POD042_HAVE_TESTS)
+    enable_testing()   # lets the "ctest" command find and run the tests
+
+    add_executable(pod042_tests tests/test_core.cpp)
+    target_link_libraries(pod042_tests PRIVATE pod042_core GTest::gtest_main)
+    pod042_configure(pod042_tests)
+
+    include(GoogleTest)
+    gtest_discover_tests(pod042_tests)   # registers every TEST() with ctest
+endif()
 
 # ---- The tests ----
 if(POD042_BUILD_TESTS)
