@@ -19,10 +19,9 @@ You boot it like an android's internal operating system. Behind the theme it is 
 - **Boot sequence**, **config file**, and a **`--json`** snapshot for scripts.
 
 ## Screenshots
+Boot Sequence
+<img width="1920" height="1080" alt="boot" src="https://github.com/user-attachments/assets/00c15d82-bc52-401a-b462-ed54e49201f1" />
 
-> 📷 **PLACEHOLDER: boot sequence**
-> File: `docs/screenshots/boot.png`
-> Show: the typewriter boot screen part-way through, with the progress bar and your pod name on the first line.
 
 > 📷 **PLACEHOLDER: system details**
 > File: `docs/screenshots/details.png`
