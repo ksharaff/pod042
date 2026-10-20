@@ -2,7 +2,7 @@
 
 A NieR:Automata-inspired system diagnostics tool for the Linux terminal, written in C++20.
 
-You boot it like an android's internal operating system. Behind the theme it is a real, live monitor: it reads CPU, memory, disk, network, processes and connections straight from `/proc` and the kernel, and reports what changes.
+It is a real, live monitor: it reads CPU, memory, disk, network, processes and connections straight from `/proc` and the kernel, and reports what changes.
 
 <img width="1890" height="902" alt="image" src="https://github.com/user-attachments/assets/de31dabe-509b-484d-8e69-cc3b9f139bff" />
 
@@ -18,33 +18,33 @@ You boot it like an android's internal operating system. Behind the theme it is 
 - **COMMS**: send text messages to another pod over TCP (see the security note below).
 - **Boot sequence**, **config file**, and a **`--json`** snapshot for scripts.
 
-## Screenshots
 
-# Boot Sequence
+## Boot Sequence
+
 <img width="1920" height="1080" alt="boot" src="https://github.com/user-attachments/assets/00c15d82-bc52-401a-b462-ed54e49201f1" />
 
-# System Details
----
+## System Details
+
 <img width="1903" height="946" alt="image" src="https://github.com/user-attachments/assets/d9a06c24-3c88-43e7-84ed-e127f3ff1e56" />
 
-# Network Connections
----
+## Network Connections
+
 <img width="1916" height="952" alt="image" src="https://github.com/user-attachments/assets/78da338a-e6d9-48db-935e-00bd821988cc" />
 
-# Process Watch
----
+## Process Watch
+
 <img width="1907" height="942" alt="image" src="https://github.com/user-attachments/assets/db8fec72-2464-4e7e-bb11-467353ff2c5f" />
 
-# Chip Configuration
----
+## Chip Configuration
+
 <img width="1897" height="954" alt="image" src="https://github.com/user-attachments/assets/766216a7-b3a7-487c-959f-f82c34c304b4" />
 
-# Comms
----
+## Comms
+
 <img width="1916" height="952" alt="image" src="https://github.com/user-attachments/assets/cbb5440f-0fac-4e12-880d-91b985cee311" />
 
-# System Logs
----
+## System Logs
+
 <img width="1916" height="945" alt="image" src="https://github.com/user-attachments/assets/a2823766-298d-494f-a0d9-fb694f9126e2" />
 
 ## Requirements
