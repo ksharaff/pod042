@@ -19,7 +19,7 @@ struct CommsConfig {
     int redialMs = 3000;                     // wait this long before dialing a missing peer again
 };
 
-enum class CommsKind { Incoming, Outgoing, System };
+enum class CommsKind { Incoming, Outgoing, System, Warning };
 
 // One line of the message history.
 struct CommsLine {

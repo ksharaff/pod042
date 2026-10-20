@@ -56,8 +56,9 @@ using namespace ftxui;
 // One named color used for every warning, so the look stays consistent.
 const Color kAmber = Color::RGB(255, 176, 0);
 
-// The dark strip drawn behind every gauge, so the empty part of a bar is visible too.
-const Color kTrack = Color::RGB(58, 58, 58);
+
+// Green for informational notices (amber is kept for warnings only).
+const Color kGreen = Color::RGB(80, 220, 120);
 
 // The gauge warning level (0.8 = 80%). It starts at the default and is set ONCE from
 // config.json at the start of main(), before any thread is created, so every thread
@@ -210,13 +211,14 @@ std::string formatProcessRow(const std::string& pid, const std::string& name,
 
 // A gauge with the dark track behind it. It turns amber at or above the warning level,
 // unless allowWarn is false (used for read-only mounts, which are expected to be full).
+// A gauge. It turns amber at or above the warning level, unless allowWarn is false
+// (used for read-only mounts, which are expected to be full).
 Element gaugeBar(double fraction, bool allowWarn = true) {
     Element bar = gauge(static_cast<float>(fraction));
     if (allowWarn && fraction >= gWarnFraction) {
         bar = bar | color(kAmber);   // decorators return a NEW element, so assign it back
     }
-    // bgcolor paints the whole gauge area, so the unfilled part shows as a dark track.
-    return bar | bgcolor(kTrack);
+    return bar;
 }
 
 // Draws one row: label, gauge, optional sparkline, value.
@@ -349,24 +351,31 @@ Element detailsPanel(const Telemetry& t, bool diskOn) {
     }
 
     // Per-core bars. With more than 8 cores they go into two columns to save height.
+        // Per-core bars. Once there are more than 4 cores they go into two columns (this also
+    // keeps the screen from getting too tall), with a thin line between the rows and a
+    // vertical line between the two columns.
     Element coreBlock;
     if (cores == 0) {
         coreBlock = text("NO PER-CORE DATA") | dim;
     } else {
         const std::size_t shownCores = std::min(cores, kMaxCoresShown);
-        const std::size_t columns = shownCores > 8 ? 2 : 1;
+        const std::size_t columns = shownCores > 4 ? 2 : 1;
         const std::size_t perColumn = (shownCores + columns - 1) / columns;   // divides, rounding up
 
         Elements columnBoxes;
         for (std::size_t col = 0; col < columns; ++col) {
             Elements rows;
             for (std::size_t i = col * perColumn; i < shownCores && i < (col + 1) * perColumn; ++i) {
+                if (i > col * perColumn) {
+                    rows.push_back(separatorLight());   // between rows, not after the last one
+                }
+                // A narrower label (4) and bar (14) so two columns fit side by side.
                 rows.push_back(meter("C" + std::to_string(i), t.corePercent[i] / 100.0,
-                                     pct(t.corePercent[i]), "", 6, 20));
+                                     pct(t.corePercent[i]), "", 4, 14));
             }
             columnBoxes.push_back(vbox(std::move(rows)) | flex);
             if (col + 1 < columns) {
-                columnBoxes.push_back(text("  "));   // a gap between the two columns
+                columnBoxes.push_back(separator());   // inside an hbox this draws a VERTICAL line
             }
         }
 
@@ -388,6 +397,9 @@ Element detailsPanel(const Telemetry& t, bool diskOn) {
         std::size_t shown = 0;
         for (const MountInfo& m : t.mounts) {
             if (shown >= kMaxMountsShown) break;
+            if (shown > 0) {
+                mountRows.push_back(separatorLight());   // a thin line between mounts
+            }
             mountRows.push_back(mountRow(m));
             ++shown;
         }
@@ -889,15 +901,24 @@ int main(int argc, char** argv) {
     // 4. BOOT SEQUENCE (typewriter)
     // ------------------------------------------------------------------
     // Some lines contain real data (the chip loadout and the operator name).
+        // The name shown on screen. It comes from profile.json, which can be edited by hand,
+    // so it is cleaned (control characters become '?'), shortened to 20 bytes so the longest
+    // boot line still fits inside the 56-column box, and upper-cased like the rest of the boot text.
+    std::string podName = toUpper(trimSpaces(sanitizeText(userName, 20)));
+    if (podName.empty()) {
+        podName = "UNIT";   // fallback if nothing usable is left
+    }
+
+    // Some lines contain real data (the pod name and the chip loadout).
     const std::vector<std::string> bootLines = {
-        "POD 042: INITIALIZING ANDROID SYSTEMS...",
+        podName + ": INITIALIZING ANDROID SYSTEMS...",
         "MEMORY BANKS ............ OK",
         "PROCESSOR CORES ......... OK",
         "STORAGE ARRAY ........... " + std::string(chips.isEnabled(kChipDisk) ? "OK" : "OFFLINE"),
         "NETWORK INTERFACE ....... " + std::string(chips.isEnabled(kChipNetwork) ? "OK" : "OFFLINE"),
         "CHIP LOADOUT ............ " + std::to_string(chips.usedSlots()) + "/" +
             std::to_string(chips.totalSlots()) + " SLOTS IN USE",
-        "ALL SYSTEMS NOMINAL. WELCOME, " + toUpper(userName) + ".",
+        "ALL SYSTEMS NOMINAL. WELCOME, " + podName + ".",
     };
 
     std::atomic<bool> booting{true};
@@ -946,7 +967,7 @@ int main(int argc, char** argv) {
         const std::size_t shown = bootChars;   // read the atomic once, then reuse it
 
         Elements rows;
-        rows.push_back(text("YoRHa // BOOT SEQUENCE") | bold);
+        rows.push_back(text("BOOT SEQUENCE") | bold);
         rows.push_back(separator());
 
         // Walk the lines, spending the revealed characters on each one:
@@ -1156,6 +1177,8 @@ int main(int argc, char** argv) {
     // Screen 5: comms (messages to other pods).
     std::string commsText;   // what the user is typing; the Input component edits it directly
     InputOption commsOption;
+    
+    commsOption.multiline = false;
     commsOption.on_enter = [&] {   // called when ENTER is pressed inside the box
         if (!commsEnabled) {
             return;
@@ -1194,23 +1217,37 @@ int main(int argc, char** argv) {
                                     "  " + link.address + (link.outbound ? "  (OUT)" : "  (IN)")));
         }
 
-        // Newest first, so the box and the latest messages stay at the top of the screen.
+        // The chat: oldest message at the top, NEWEST AT THE BOTTOM, like a messenger.
+        const std::size_t kChatLinesShown = 50;     // how many of the latest lines are drawn
+        const int kChatPaddingRows = 80;            // blank rows that push the messages down
+
         Elements history;
+        // The blank rows come first. The area below is a scrolling frame that always keeps
+        // the LAST row in view, so the blank rows scroll out of sight at the top, and the
+        // newest message sits right above the typing box even when there are only a few.
+        for (int i = 0; i < kChatPaddingRows; ++i) {
+            history.push_back(text(""));
+        }
+
         const std::size_t total = snap.lines.size();
-        const std::size_t shownCount = std::min<std::size_t>(total, 10);
-        for (std::size_t i = 0; i < shownCount; ++i) {
-            const CommsLine& line = snap.lines[total - 1 - i];
+        const std::size_t first = total > kChatLinesShown ? total - kChatLinesShown : 0;
+        for (std::size_t i = first; i < total; ++i) {
+            const CommsLine& line = snap.lines[i];
             // paragraph() wraps long text over several lines instead of cutting it off.
             Element row = paragraph("[" + line.time + "] " + line.text);
-            if (line.kind == CommsKind::Outgoing) {
-                row = row | dim;
-            } else if (line.kind == CommsKind::System) {
-                row = row | color(kAmber);
+            switch (line.kind) {
+                case CommsKind::Outgoing: row = row | dim; break;               // your own messages: quiet
+                case CommsKind::System:   row = row | color(kGreen); break;     // info: green
+                case CommsKind::Warning:  row = row | color(kAmber); break;     // warnings: amber
+                case CommsKind::Incoming: break;                                // incoming: normal color
+            }
+            if (i + 1 == total) {
+                row = row | focus;   // "focus" marks the row the scrolling frame must keep in view
             }
             history.push_back(row);
         }
-        if (history.empty()) {
-            history.push_back(text("NO TRANSMISSIONS YET") | dim);
+        if (total == 0) {
+            history.push_back(text("NO TRANSMISSIONS YET") | dim | focus);
         }
 
         return vbox({
@@ -1221,9 +1258,11 @@ int main(int argc, char** argv) {
             separator(),
             vbox(std::move(linkRows)),
             separator(),
-            hbox({text("> "), commsInput->Render() | flex}) | border,
-            vbox(std::move(history)),
+            // yframe = a scrolling window; flex = it takes all the free height, so the
+            // typing box below is always at the bottom of the screen.
+            vbox(std::move(history)) | yframe | flex,
             separator(),
+            hbox({text("> "), commsInput->Render() | flex}) | border,
             text("RIGHT: focus message box   ENTER: send   ESC: back to menu") | dim,
         });
     });
@@ -1278,7 +1317,7 @@ int main(int argc, char** argv) {
 
         return vbox({
             vbox({
-                text("YoRHa // UNIT DIAGNOSTICS") | bold,
+                text("UNIT DIAGNOSTICS") | bold,
                 text("NAME: " + userName),
                 statusLine,
             }) | border,

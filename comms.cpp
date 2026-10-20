@@ -296,7 +296,7 @@ void CommsNode::stop() {
 }
 
 bool CommsNode::send(const std::string& text) {
-    const std::string clean = trimSpaces(sanitizeText(text, kMaxMessageBytes));
+    const std::string clean = trimSpaces(sanitizeText(trimSpaces(text), kMaxMessageBytes));
     if (clean.empty() || !running_) {
         return false;
     }
