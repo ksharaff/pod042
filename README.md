@@ -19,33 +19,34 @@ You boot it like an android's internal operating system. Behind the theme it is 
 - **Boot sequence**, **config file**, and a **`--json`** snapshot for scripts.
 
 ## Screenshots
-Boot Sequence
+
+# Boot Sequence
+---
 <img width="1920" height="1080" alt="boot" src="https://github.com/user-attachments/assets/00c15d82-bc52-401a-b462-ed54e49201f1" />
 
+# System Details
+---
+<img width="1903" height="946" alt="image" src="https://github.com/user-attachments/assets/d9a06c24-3c88-43e7-84ed-e127f3ff1e56" />
 
-> 📷 **PLACEHOLDER: system details**
-> File: `docs/screenshots/details.png`
-> Show: the SYSTEM DETAILS screen with the per-core bars and the mounted filesystems.
+# Network Connections
+---
+<img width="1916" height="952" alt="image" src="https://github.com/user-attachments/assets/78da338a-e6d9-48db-935e-00bd821988cc" />
 
-> 📷 **PLACEHOLDER: network connections**
-> File: `docs/screenshots/connections.png`
-> Show: the NETWORK CONNECTIONS table with the OWNER column filled in and one amber listener row. Check the addresses and process names before publishing (see the notes at the end).
+# Process Watch
+---
+<img width="1907" height="942" alt="image" src="https://github.com/user-attachments/assets/db8fec72-2464-4e7e-bb11-467353ff2c5f" />
 
-> 📷 **PLACEHOLDER: chip configuration**
-> File: `docs/screenshots/chips.png`
-> Show: the CHIP CONFIGURATION screen with a few chips installed, the slot gauge, and the preset line.
+# Chip Configuration
+---
+<img width="1897" height="954" alt="image" src="https://github.com/user-attachments/assets/766216a7-b3a7-487c-959f-f82c34c304b4" />
 
-> 📷 **PLACEHOLDER: comms**
-> File: `docs/screenshots/comms.png`
-> Show: the COMMS screen with a short conversation between two pods, the link line, and the message box at the bottom.
+# Comms
+---
+<img width="1916" height="952" alt="image" src="https://github.com/user-attachments/assets/cbb5440f-0fac-4e12-880d-91b985cee311" />
 
-> 📷 **PLACEHOLDER: event log**
-> File: `docs/screenshots/logs.png`
-> Show: the SYSTEM LOGS screen with a few feed entries (a new listener, a new connection, a warning in amber).
-
-> 🎞 **OPTIONAL PLACEHOLDER: demo GIF**
-> File: `docs/demo.gif`
-> Show: boot sequence, then switching through the screens and installing a chip (about 15 seconds).
+# System Logs
+---
+<img width="1916" height="945" alt="image" src="https://github.com/user-attachments/assets/a2823766-298d-494f-a0d9-fb694f9126e2" />
 
 ## Requirements
 
